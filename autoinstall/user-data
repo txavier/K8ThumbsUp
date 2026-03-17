@@ -1,4 +1,8 @@
 #cloud-config
+#
+# Set a custom hostname below, or leave empty for auto-generated (k8s-node-<mac>)
+# NODE_HOSTNAME: my-node-name
+#
 autoinstall:
   version: 1
 
@@ -38,6 +42,18 @@ autoinstall:
 
   # Run node-setup steps after install, before first reboot
   late-commands:
+    # Set hostname: uses NODE_HOSTNAME from top of file if set, otherwise auto-generates from MAC
+    - |
+      CUSTOM=$(grep '^NODE_HOSTNAME:' /autoinstall.yaml 2>/dev/null | awk '{print $2}' || true)
+      if [[ -n "$CUSTOM" ]]; then
+        NODENAME="$CUSTOM"
+      else
+        MAC_SUFFIX=$(ip link show | awk '/ether/{print $2; exit}' | tr -d ':' | tail -c 7)
+        NODENAME="k8s-node-${MAC_SUFFIX}"
+      fi
+      echo "$NODENAME" > /target/etc/hostname
+      sed -i "s/k8s-node/$NODENAME/g" /target/etc/hosts
+
     # Disable swap in fstab
     - sed -i '/\sswap\s/s/^/#/' /target/etc/fstab
 
