@@ -51,28 +51,18 @@ Ubuntu + Kubernetes installed in one shot, no interaction needed.
 
 #### Prepare the USB drive
 
-1. **Install Ventoy** on the USB:
+1. **Download the Ubuntu Server 24.04 ISO** into this directory:
+   https://ubuntu.com/download/server
+
+2. **Run the prep script** (downloads Ventoy, formats USB, copies everything):
    ```bash
-   # Download Ventoy from https://www.ventoy.net/en/download.html
-   tar xzf ventoy-*-linux.tar.gz
-   cd ventoy-*
-   sudo bash Ventoy2Disk.sh -i /dev/sdX   # replace sdX with your USB device (check with lsblk)
+   sudo bash prepare-usb.sh /dev/sdX   # replace sdX with your USB device (check with lsblk)
    ```
 
-2. **Copy these files** onto the Ventoy data partition:
-   ```
-   USB drive root:
-   ├── ubuntu-24.04-live-server-amd64.iso    # download from ubuntu.com/download/server
-   └── ventoy/
-       ├── ventoy.json                        # from this repo: ventoy/ventoy.json
-       └── autoinstall/
-           ├── user-data                      # from this repo: autoinstall/user-data
-           └── meta-data                      # from this repo: autoinstall/meta-data (empty file)
-   ```
-
-3. **Edit `user-data`** before first use:
-   - Change the `password` hash (default login: `kube` / `changeme`)
-   - Generate a new hash: `mkpasswd --method=SHA-512 yourpassword`
+3. **Edit `user-data`** before first use (optional):
+   - Default login: `kube` / `changeme`
+   - To change the password, generate a new hash: `mkpasswd --method=SHA-512 yourpassword`
+   - Update the `password` field in `autoinstall/user-data`, then re-run `prepare-usb.sh`
 
 #### For each new machine
 
