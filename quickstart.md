@@ -67,18 +67,18 @@ Ubuntu + Kubernetes installed in one shot, no interaction needed.
 #### For each new machine
 
 1. **Plug in USB, boot from it** — select the Ubuntu ISO
-2. **Walk away** — Ubuntu installs, sets up containerd + kubeadm automatically
-3. **After reboot, SSH in** from the master and join the cluster:
+2. **Walk away** — Ubuntu installs, sets up containerd + kubeadm, and **auto-joins the cluster** on first boot
+3. **Verify on the master:**
    ```bash
-   # On the master — get the join command:
-   kubeadm token create --print-join-command
-
-   # SSH into the new node and run it:
-   ssh kube@<node-ip>
-   sudo kubeadm join REDACTED_IP:6443 --token <token> \
-     --discovery-token-ca-cert-hash sha256:<hash>
+   kubectl get nodes
    ```
 4. **Unplug the USB** and move to the next machine.
+
+> **How auto-join works:** Each node has a restricted SSH key that can *only* run
+> `kubeadm token create --print-join-command` on the master. A systemd service
+> (`k8s-auto-join`) runs once on first boot, SSHs to the master, gets a fresh token,
+> and joins. Logs are at `/var/log/k8s-auto-join.log` on the node.
+> The key is in `keys/node-join` — if you regenerate it, re-run `prepare-usb.sh`.
 
 ---
 

@@ -106,7 +106,15 @@ echo ""
 echo "=== [4/4] Copying autoinstall and Ventoy config ==="
 mkdir -p "${MOUNT_POINT}/ventoy/autoinstall"
 
-cp -v "$SCRIPT_DIR/autoinstall/user-data" "${MOUNT_POINT}/ventoy/autoinstall/user-data"
+# Inject the SSH private key into user-data (replaces placeholder)
+NODE_KEY="$SCRIPT_DIR/keys/node-join"
+[[ -f "$NODE_KEY" ]] || die "SSH key not found at $NODE_KEY — run: ssh-keygen -t ed25519 -f $NODE_KEY -N '' -C k8s-node-auto-join"
+
+KEY_CONTENT=$(sed 's/^/      /' "$NODE_KEY")
+sed "s|      __NODE_JOIN_KEY_PLACEHOLDER__|${KEY_CONTENT//$'\n'/\\n}|" \
+  "$SCRIPT_DIR/autoinstall/user-data" > "${MOUNT_POINT}/ventoy/autoinstall/user-data"
+echo "  user-data (with key injected)"
+
 cp -v "$SCRIPT_DIR/autoinstall/meta-data" "${MOUNT_POINT}/ventoy/autoinstall/meta-data"
 
 # Write ventoy.json, matching the actual ISO filename

@@ -77,3 +77,73 @@ autoinstall:
     - curtin in-target -- apt-get install -y -qq kubelet kubeadm kubectl
     - curtin in-target -- apt-mark hold kubelet kubeadm kubectl
     - curtin in-target -- systemctl enable kubelet
+
+    # Install SSH private key for auto-join (restricted to token command only on master)
+    - curtin in-target -- mkdir -p /etc/kubernetes
+    - |
+      cat > /target/etc/kubernetes/node-join-key <<'KEYEOF'
+      __NODE_JOIN_KEY_PLACEHOLDER__
+      KEYEOF
+    - sed -i 's/^      //' /target/etc/kubernetes/node-join-key
+    - chmod 600 /target/etc/kubernetes/node-join-key
+
+    # Install auto-join script
+    - |
+      cat > /target/usr/local/bin/k8s-auto-join.sh <<'SCRIPTEOF'
+      #!/usr/bin/env bash
+      set -euo pipefail
+      MASTER_IP="REDACTED_IP"
+      MASTER_USER="theo"
+      SSH_KEY="/etc/kubernetes/node-join-key"
+      LOG="/var/log/k8s-auto-join.log"
+      STAMP="/etc/kubernetes/.joined"
+      exec > >(tee -a "$LOG") 2>&1
+      echo "[$(date)] auto-join: starting"
+      if [[ -f "$STAMP" ]]; then
+        echo "[$(date)] auto-join: already joined, skipping"
+        exit 0
+      fi
+      echo "[$(date)] auto-join: waiting for network..."
+      for i in $(seq 1 30); do
+        if ping -c1 -W2 "$MASTER_IP" >/dev/null 2>&1; then
+          echo "[$(date)] auto-join: master reachable"
+          break
+        fi
+        sleep 5
+      done
+      if ! ping -c1 -W2 "$MASTER_IP" >/dev/null 2>&1; then
+        echo "[$(date)] auto-join: ERROR — cannot reach master at $MASTER_IP"
+        exit 1
+      fi
+      echo "[$(date)] auto-join: requesting join command from master..."
+      JOIN_CMD=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "${MASTER_USER}@${MASTER_IP}" 2>/dev/null)
+      if [[ -z "$JOIN_CMD" || ! "$JOIN_CMD" =~ "kubeadm join" ]]; then
+        echo "[$(date)] auto-join: ERROR — did not receive a valid join command"
+        exit 1
+      fi
+      echo "[$(date)] auto-join: joining cluster..."
+      $JOIN_CMD
+      mkdir -p /etc/kubernetes
+      touch "$STAMP"
+      echo "[$(date)] auto-join: successfully joined the cluster"
+      SCRIPTEOF
+    - chmod 755 /target/usr/local/bin/k8s-auto-join.sh
+
+    # Create systemd service for first-boot auto-join
+    - |
+      cat > /target/etc/systemd/system/k8s-auto-join.service <<'SVCEOF'
+      [Unit]
+      Description=Auto-join Kubernetes cluster
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=!/etc/kubernetes/.joined
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/k8s-auto-join.sh
+      RemainAfterExit=true
+
+      [Install]
+      WantedBy=multi-user.target
+      SVCEOF
+    - curtin in-target -- systemctl enable k8s-auto-join.service
