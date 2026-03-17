@@ -1,0 +1,27 @@
+# Calico Installation - Tigera Operator method
+# Step 1: Install the Tigera operator and CRDs
+# Run BEFORE applying this file:
+#   kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.2/manifests/tigera-operator.yaml
+#
+# Step 2: Apply this file:
+#   kubectl apply -f calico.yaml
+
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    ipPools:
+    - name: default-ipv4-ippool
+      blockSize: 26
+      cidr: 192.172.0.0/16
+      encapsulation: VXLANCrossSubnet
+      natOutgoing: Enabled
+      nodeSelector: all()
+---
+apiVersion: operator.tigera.io/v1
+kind: APIServer
+metadata:
+  name: default
+spec: {}
