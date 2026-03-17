@@ -1,0 +1,13 @@
+{
+    "control": [
+        {
+            "VTOY_DEFAULT_SEARCH_ROOT": "/ventoy"
+        }
+    ],
+    "auto_install": [
+        {
+            "image": "/ubuntu-24.04-live-server-amd64.iso",
+            "template": "/ventoy/autoinstall/user-data"
+        }
+    ]
+}

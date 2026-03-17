@@ -45,27 +45,73 @@ kubectl apply -f calico.yaml
 
 ## Worker Node Setup (USB Thumb Drive)
 
-### What you need on the thumb drive
+### Option A: Fully Automated (Autoinstall) — recommended
+
+Ubuntu + Kubernetes installed in one shot, no interaction needed.
+
+#### Prepare the USB drive
+
+1. **Install Ventoy** on the USB:
+   ```bash
+   # Download Ventoy from https://www.ventoy.net/en/download.html
+   tar xzf ventoy-*-linux.tar.gz
+   cd ventoy-*
+   sudo bash Ventoy2Disk.sh -i /dev/sdX   # replace sdX with your USB device (check with lsblk)
+   ```
+
+2. **Copy these files** onto the Ventoy data partition:
+   ```
+   USB drive root:
+   ├── ubuntu-24.04-live-server-amd64.iso    # download from ubuntu.com/download/server
+   └── ventoy/
+       ├── ventoy.json                        # from this repo: ventoy/ventoy.json
+       └── autoinstall/
+           ├── user-data                      # from this repo: autoinstall/user-data
+           └── meta-data                      # from this repo: autoinstall/meta-data (empty file)
+   ```
+
+3. **Edit `user-data`** before first use:
+   - Change the `password` hash (default login: `kube` / `changeme`)
+   - Generate a new hash: `mkpasswd --method=SHA-512 yourpassword`
+
+#### For each new machine
+
+1. **Plug in USB, boot from it** — select the Ubuntu ISO
+2. **Walk away** — Ubuntu installs, sets up containerd + kubeadm automatically
+3. **After reboot, SSH in** from the master and join the cluster:
+   ```bash
+   # On the master — get the join command:
+   kubeadm token create --print-join-command
+
+   # SSH into the new node and run it:
+   ssh kube@<node-ip>
+   sudo kubeadm join REDACTED_IP:6443 --token <token> \
+     --discovery-token-ca-cert-hash sha256:<hash>
+   ```
+4. **Unplug the USB** and move to the next machine.
+
+---
+
+### Option B: Manual (node-setup.sh)
+
+If you prefer to install Ubuntu manually, or already have Ubuntu running on a machine.
+
+#### What you need on the thumb drive
 
 1. **Ubuntu Server 24.04 LTS ISO** — download from https://ubuntu.com/download/server
 2. **`node-setup.sh`** — the script in this repo that installs containerd + kubeadm
 
-Use a tool like [Ventoy](https://www.ventoy.net/) on the USB drive. Ventoy lets you boot ISOs
-directly and still store extra files on the same drive:
+Use Ventoy so the USB can hold both the ISO and the script:
 
 ```bash
-# On the master, install Ventoy to the USB (e.g. /dev/sdb — check with lsblk)
-# Download Ventoy from https://www.ventoy.net/en/download.html
-tar xzf ventoy-*-linux.tar.gz
-cd ventoy-*
-sudo bash Ventoy2Disk.sh -i /dev/sdX   # replace sdX with your USB device
+sudo bash Ventoy2Disk.sh -i /dev/sdX
 ```
 
 Then copy onto the USB drive:
 - The Ubuntu Server 24.04 ISO
 - `node-setup.sh` from this repo
 
-### For each new machine
+#### For each new machine
 
 1. **Boot from the USB drive** and select the Ubuntu Server ISO
 2. **Install Ubuntu Server 24.04** (minimal install is fine, enable SSH)
@@ -86,7 +132,7 @@ Then copy onto the USB drive:
    ```
 5. **Unplug the USB** and move to the next machine. Repeat steps 1–4.
 
-### Alternative: run the script over the network
+#### Alternative: run the script over the network
 
 If the new node is already on WiFi, you can skip the USB for the script:
 

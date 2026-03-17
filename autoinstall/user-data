@@ -1,0 +1,79 @@
+#cloud-config
+autoinstall:
+  version: 1
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # Wipe the first disk and do a minimal install
+  storage:
+    layout:
+      name: lvm
+      sizing-policy: all
+
+  # Create a user — change password before use!
+  # Default password: "changeme" (you'll be forced to change on first login)
+  identity:
+    hostname: k8s-node
+    username: kube
+    # mkpasswd --method=SHA-512 changeme
+    password: "REDACTED_PASSWORD_HASH"
+
+  # Install SSH during OS installation
+  ssh:
+    install-server: true
+    allow-pw: true
+
+  # Minimal package set — node-setup.sh handles the rest
+  packages:
+    - curl
+    - ca-certificates
+    - gpg
+    - apt-transport-https
+
+  # Disable swap partition (Ubuntu Server sometimes creates one)
+  swap:
+    size: 0
+
+  # Run node-setup steps after install, before first reboot
+  late-commands:
+    # Disable swap in fstab
+    - sed -i '/\sswap\s/s/^/#/' /target/etc/fstab
+
+    # Kernel modules for Kubernetes
+    - |
+      cat > /target/etc/modules-load.d/k8s.conf <<EOF
+      overlay
+      br_netfilter
+      EOF
+
+    # Sysctl params for Kubernetes networking
+    - |
+      cat > /target/etc/sysctl.d/k8s.conf <<EOF
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+      EOF
+
+    # Install containerd
+    - curtin in-target -- apt-get update -qq
+    - curtin in-target -- apt-get install -y -qq containerd
+    - curtin in-target -- mkdir -p /etc/containerd
+    - curtin in-target -- bash -c "containerd config default > /etc/containerd/config.toml"
+    - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /target/etc/containerd/config.toml
+    - curtin in-target -- systemctl enable containerd
+
+    # Add Kubernetes apt repo
+    - curtin in-target -- mkdir -p /etc/apt/keyrings
+    - curtin in-target -- bash -c "curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+    - |
+      cat > /target/etc/apt/sources.list.d/kubernetes.list <<EOF
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /
+      EOF
+
+    # Install kubeadm, kubelet, kubectl
+    - curtin in-target -- apt-get update -qq
+    - curtin in-target -- apt-get install -y -qq kubelet kubeadm kubectl
+    - curtin in-target -- apt-mark hold kubelet kubeadm kubectl
+    - curtin in-target -- systemctl enable kubelet
