@@ -7,13 +7,7 @@ Pod CIDR: **192.172.0.0/16** (avoids overlap with WiFi subnet `REDACTED_SUBNET/2
 
 ## Master Node Setup
 
-### 1. Install the Tigera Calico operator
-
-```bash
-kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.2/manifests/tigera-operator.yaml
-```
-
-### 2. Initialize the cluster
+### 1. Initialize the cluster
 
 ```bash
 sudo kubeadm init \
@@ -22,12 +16,23 @@ sudo kubeadm init \
   --node-name=REDACTED_HOSTNAME
 ```
 
-### 3. Set up kubeconfig
+### Join command
+```bash
+kubeadm join REDACTED_IP:6443 --token REDACTED_TOKEN --discovery-token-ca-cert-hash sha256:REDACTED_HASH 
+```
+
+### 2. Set up kubeconfig
 
 ```bash
 mkdir -p $HOME/.kube
 sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
 sudo chown $(id -u):$(id -g) $HOME/.kube/config
+```
+
+### 3. Install the Tigera Calico operator
+
+```bash
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.2/manifests/tigera-operator.yaml
 ```
 
 ### 4. Install Calico CNI
