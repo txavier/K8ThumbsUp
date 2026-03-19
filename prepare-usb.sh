@@ -145,7 +145,7 @@ if [[ "$list_confirm" =~ ^[Yy]$ ]]; then
     echo "--- $part ($fstype, $size${label:+, label=$label}) ---"
     if mount -o ro "$part" "$mnt" 2>/dev/null; then
       ls -1 "$mnt" 2>/dev/null | head -20
-      umount "$mnt" 2>/dev/null
+      umount "$mnt" 2>/dev/null || true
     else
       echo "  (could not mount)"
     fi
