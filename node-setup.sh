@@ -8,7 +8,8 @@
 set -euo pipefail
 
 KUBE_VERSION="1.35"
-MASTER_IP="REDACTED_IP"
+# Set MASTER_IP env var before running, or edit this line
+MASTER_IP="${MASTER_IP:?Set MASTER_IP — e.g. export MASTER_IP=10.0.0.1}"
 
 if [[ $EUID -ne 0 ]]; then
   echo "Error: run this script as root (sudo bash node-setup.sh)"

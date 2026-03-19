@@ -4,8 +4,9 @@
 
 set -euo pipefail
 
-MASTER_IP="REDACTED_IP"
-MASTER_USER="theo"
+# Set these before running, or source secrets.env
+MASTER_IP="${MASTER_IP:?Set MASTER_IP}"
+MASTER_USER="${MASTER_USER:?Set MASTER_USER}"
 SSH_KEY="/etc/kubernetes/node-join-key"
 LOG="/var/log/k8s-auto-join.log"
 STAMP="/etc/kubernetes/.joined"
