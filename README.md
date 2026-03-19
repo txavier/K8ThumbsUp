@@ -129,6 +129,7 @@ Before erasing, it offers to list the drive's current contents.
 ├── keys/                  # SSH keypair for auto-join (gitignored)
 ├── prepare-usb.sh         # Builds and flashes the USB drive
 ├── node-setup.sh          # Manual node setup (alternative to USB)
+├── deploy-monitoring.sh   # Deploys Prometheus + Grafana monitoring
 ├── calico.yaml            # Calico CNI config (custom pod CIDR)
 ├── quickstart.md          # Detailed setup notes
 ├── secrets.env.example    # Template for WiFi + password credentials
@@ -153,3 +154,24 @@ Boot logs are also auto-saved to the USB's CIDATA partition under `boot-logs/<ho
 ```bash
 kubeadm token create --print-join-command
 ```
+
+## Monitoring
+
+Deploy Prometheus + Grafana for CPU, per-core, and thread monitoring:
+
+```bash
+bash deploy-monitoring.sh
+```
+
+This installs the kube-prometheus-stack (Prometheus, Grafana, node-exporter, kube-state-metrics).
+
+Access Grafana:
+```bash
+kubectl port-forward -n monitoring svc/kube-prometheus-stack-grafana 3000:80
+# Open http://localhost:3000  (admin / prom-operator)
+```
+
+Pre-installed dashboards:
+- **Node Exporter / Nodes** — per-core CPU usage, load averages, thread counts
+- **K8s / Compute Resources / Cluster** — cluster-wide CPU/memory overview
+- **K8s / Compute Resources / Pod** — per-pod breakdown on each node
