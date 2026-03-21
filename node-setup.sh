@@ -16,11 +16,21 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-echo "=== [1/8] Disabling swap ==="
+echo "=== [1/9] Keeping system awake with lid closed ==="
+mkdir -p /etc/systemd/logind.conf.d
+cat > /etc/systemd/logind.conf.d/lid.conf <<EOF
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+EOF
+systemctl restart systemd-logind
+
+echo "=== [2/9] Disabling swap ==="
 swapoff -a
 sed -i '/\sswap\s/s/^/#/' /etc/fstab
 
-echo "=== [2/8] Loading kernel modules ==="
+echo "=== [3/9] Loading kernel modules ==="
 cat > /etc/modules-load.d/k8s.conf <<EOF
 overlay
 br_netfilter
@@ -28,7 +38,7 @@ EOF
 modprobe overlay
 modprobe br_netfilter
 
-echo "=== [3/8] Setting sysctl params ==="
+echo "=== [4/9] Setting sysctl params ==="
 cat > /etc/sysctl.d/k8s.conf <<EOF
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
@@ -36,7 +46,7 @@ net.ipv4.ip_forward                 = 1
 EOF
 sysctl --system >/dev/null 2>&1
 
-echo "=== [4/8] Installing containerd ==="
+echo "=== [5/9] Installing containerd ==="
 apt-get update -qq
 apt-get install -y -qq containerd >/dev/null
 mkdir -p /etc/containerd
@@ -46,7 +56,7 @@ sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.to
 systemctl restart containerd
 systemctl enable containerd
 
-echo "=== [5/8] Adding Kubernetes apt repo ==="
+echo "=== [6/9] Adding Kubernetes apt repo ==="
 apt-get install -y -qq apt-transport-https ca-certificates curl gpg >/dev/null
 mkdir -p /etc/apt/keyrings
 curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${KUBE_VERSION}/deb/Release.key" \
@@ -54,17 +64,17 @@ curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${KUBE_VERSION}/deb/Release.key" 
 echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${KUBE_VERSION}/deb/ /" \
   > /etc/apt/sources.list.d/kubernetes.list
 
-echo "=== [6/8] Installing kubeadm, kubelet, kubectl ==="
+echo "=== [7/9] Installing kubeadm, kubelet, kubectl ==="
 apt-get update -qq
 apt-get install -y -qq kubelet kubeadm kubectl >/dev/null
 apt-mark hold kubelet kubeadm kubectl
 
-echo "=== [7/8] Installing and enabling SSH ==="
+echo "=== [8/9] Installing and enabling SSH ==="
 apt-get install -y -qq openssh-server >/dev/null
 systemctl enable ssh
 systemctl start ssh
 
-echo "=== [8/8] Enabling kubelet ==="
+echo "=== [9/9] Enabling kubelet ==="
 systemctl enable kubelet
 
 echo ""
