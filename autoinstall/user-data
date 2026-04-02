@@ -367,6 +367,48 @@ autoinstall:
       umount /target/proc 2>/dev/null || true
       umount /target/dev 2>/dev/null || true
 
+    # Rook Ceph: if disk has >100G in the VG, shrink root LV to 100G
+    # and create a raw LV (no filesystem) for Ceph OSD storage.
+    # Disks with <=100G are left as-is — they won't be Ceph nodes.
+    - |
+      set +e
+      VG_NAME="ubuntu-vg"
+      LV_PATH="/dev/${VG_NAME}/ubuntu-lv"
+      MIN_ROOT_G=100
+      vgs "$VG_NAME" >/dev/null 2>&1 || { echo "VG $VG_NAME not found, skipping Ceph LV" >&2; exit 0; }
+      VG_SIZE_B=$(vgs --noheadings --nosuffix --units b -o vg_size "$VG_NAME" 2>/dev/null | tr -d ' ')
+      VG_SIZE_G=$((VG_SIZE_B / 1073741824))
+      if [ "$VG_SIZE_G" -le "$MIN_ROOT_G" ]; then
+        echo "=== Rook Ceph: VG is ${VG_SIZE_G}G (<= ${MIN_ROOT_G}G) — not a Ceph node ===" >&2
+        exit 0
+      fi
+      echo "=== Rook Ceph: VG is ${VG_SIZE_G}G — creating Ceph OSD LV ===" >&2
+      # Save mount state under /target so we can restore it afterward
+      MOUNT_SAVE=$(mktemp)
+      findmnt -rn -o TARGET,SOURCE | awk '$1 ~ "^/target"' | sort -r > "$MOUNT_SAVE"
+      # Unmount /target tree (deepest mounts first)
+      while read -r tgt src; do
+        [ -n "$tgt" ] && { umount "$tgt" 2>/dev/null || umount -l "$tgt" 2>/dev/null || true; }
+      done < "$MOUNT_SAVE"
+      # Shrink filesystem to 99G first (1G safety buffer), then shrink LV to 100G,
+      # then expand filesystem to fill the exact LV size
+      if e2fsck -f -y "$LV_PATH" >&2 && resize2fs "$LV_PATH" 99G >&2; then
+        lvreduce -f -L ${MIN_ROOT_G}G "$LV_PATH" >&2
+        resize2fs "$LV_PATH" >&2
+        # Create raw LV for Rook Ceph (no filesystem — Ceph manages the block device)
+        lvcreate -l 100%FREE -n ceph-osd "$VG_NAME" >&2
+        echo "=== Rook Ceph: OSD LV created ===" >&2
+        lvs "$VG_NAME" >&2
+      else
+        echo "=== Rook Ceph: filesystem resize failed, skipping ===" >&2
+      fi
+      # Remount everything (shallowest first)
+      sort "$MOUNT_SAVE" | while read -r tgt src; do
+        [ -n "$tgt" ] && { mount "$src" "$tgt" 2>/dev/null || true; }
+      done
+      rm -f "$MOUNT_SAVE"
+      true
+
     # Copy install logs to USB drive for debugging
     - |
       USB_PART=$(blkid -t LABEL="CIDATA" -o device 2>/dev/null | head -1)
