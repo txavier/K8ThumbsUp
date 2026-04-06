@@ -1,0 +1,407 @@
+#cloud-config
+#
+# Autoinstall config for a Kubernetes HEAD (control-plane) node.
+# This initialises the cluster, installs Calico, and configures SSH for worker auto-join.
+#
+autoinstall:
+  version: 1
+  interactive-sections: []
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # WiFi via early-commands: install wpasupplicant, then netplan apply
+  early-commands:
+    - |
+      IFACE=$(ls /sys/class/net/ | grep -E '^wl' | head -1)
+      if [ -n "$IFACE" ]; then
+        apt-get install --quiet --assume-yes wpasupplicant 2>/dev/null || true
+        systemctl start wpa_supplicant.service 2>/dev/null || true
+        rfkill unblock wifi 2>/dev/null || true
+        ip link set "$IFACE" up
+        printf 'network:\n  version: 2\n  wifis:\n    %s:\n      dhcp4: true\n      access-points:\n        "__WIFI_SSID__":\n          password: "__WIFI_PASSWORD__"\n' "$IFACE" > /etc/netplan/99-wifi-early.yaml
+        chmod 600 /etc/netplan/99-wifi-early.yaml
+        netplan apply 2>/dev/null || true
+        for i in $(seq 1 30); do
+          if ip addr show "$IFACE" | grep -q 'inet '; then break; fi
+          sleep 2
+        done
+      fi
+
+  # Wipe the first disk and do a minimal install
+  storage:
+    layout:
+      name: lvm
+      sizing-policy: all
+
+  # Create a user
+  identity:
+    hostname: k8s-head
+    username: kube
+    password: "__PASSWORD_HASH__"
+
+  # Install SSH during OS installation
+  ssh:
+    install-server: true
+    allow-pw: true
+
+  # Minimal package set — late-commands handle the rest
+  packages:
+    - curl
+    - ca-certificates
+    - gpg
+    - apt-transport-https
+
+  # Disable swap partition
+  swap:
+    size: 0
+
+  # Run head-node setup steps after install, before first reboot
+  #
+  # IMPORTANT: File-write operations come FIRST (before any chroot/apt commands)
+  # because subiquity stops processing late-commands if any command fails.
+  #
+  late-commands:
+    # Persist WiFi config in the installed system
+    - |
+      WIFI_IFACE=$(ls /sys/class/net/ | grep -E '^wl' | head -1)
+      if [ -n "$WIFI_IFACE" ]; then
+        cat > /target/etc/netplan/90-wifi.yaml <<WIFIEOF
+      network:
+        version: 2
+        wifis:
+          ${WIFI_IFACE}:
+            dhcp4: true
+            access-points:
+              "__WIFI_SSID__":
+                password: "__WIFI_PASSWORD__"
+      WIFIEOF
+        chmod 600 /target/etc/netplan/90-wifi.yaml
+      fi
+
+    # Set hostname
+    - echo "k8s-head" > /target/etc/hostname
+    - sed -i "s/k8s-head/k8s-head/g" /target/etc/hosts
+
+    # Disable swap in fstab
+    - sed -i '/\sswap\s/s/^/#/' /target/etc/fstab
+
+    # Keep running with lid closed
+    - |
+      mkdir -p /target/etc/systemd/logind.conf.d
+      cat > /target/etc/systemd/logind.conf.d/lid.conf <<EOF
+      [Login]
+      HandleLidSwitch=ignore
+      HandleLidSwitchExternalPower=ignore
+      HandleLidSwitchDocked=ignore
+      EOF
+
+    # Kernel modules for Kubernetes
+    - |
+      cat > /target/etc/modules-load.d/k8s.conf <<EOF
+      overlay
+      br_netfilter
+      EOF
+
+    # Sysctl params for Kubernetes networking
+    - |
+      cat > /target/etc/sysctl.d/k8s.conf <<EOF
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+      EOF
+
+    # Disable cloud-init on the installed system
+    - mkdir -p /target/etc/cloud && touch /target/etc/cloud/cloud-init.disabled
+
+    # Install SSH public key for worker auto-join (restricted to kubeadm token command)
+    - |
+      mkdir -p /target/home/kube/.ssh
+      cat > /target/home/kube/.ssh/authorized_keys <<'AUTHEOF'
+      __NODE_JOIN_AUTHORIZED_KEY__
+      AUTHEOF
+    - sed -i 's/^      //' /target/home/kube/.ssh/authorized_keys
+    - chmod 700 /target/home/kube/.ssh
+    - chmod 600 /target/home/kube/.ssh/authorized_keys
+    - chown -R 1000:1000 /target/home/kube/.ssh
+
+    # Install kubeadm-init script (runs on first boot to initialise the cluster)
+    - |
+      cat > /target/usr/local/bin/k8s-head-init.sh <<'SCRIPTEOF'
+      #!/usr/bin/env bash
+      set -euo pipefail
+      POD_CIDR="__POD_CIDR__"
+      LOG="/var/log/k8s-head-init.log"
+      STAMP="/etc/kubernetes/.head-init-done"
+      exec > >(tee -a "$LOG") 2>&1
+      echo "[$(date)] head-init: starting"
+      if [[ -f "$STAMP" ]]; then
+        echo "[$(date)] head-init: already initialised, skipping"
+        exit 0
+      fi
+      # Wait for network
+      echo "[$(date)] head-init: waiting for network..."
+      for i in $(seq 1 30); do
+        if ip route | grep -q default; then
+          echo "[$(date)] head-init: network up"
+          break
+        fi
+        sleep 5
+      done
+      # Load kernel modules
+      modprobe overlay 2>/dev/null || true
+      modprobe br_netfilter 2>/dev/null || true
+      sysctl --system >/dev/null 2>&1 || true
+      # Ensure containerd is running
+      systemctl start containerd 2>/dev/null || true
+      # Initialise the cluster
+      echo "[$(date)] head-init: running kubeadm init..."
+      kubeadm init --pod-network-cidr="$POD_CIDR" 2>&1
+      # Set up kubectl for kube user
+      KUBE_HOME="/home/kube"
+      mkdir -p "$KUBE_HOME/.kube"
+      cp /etc/kubernetes/admin.conf "$KUBE_HOME/.kube/config"
+      chown -R 1000:1000 "$KUBE_HOME/.kube"
+      # Also set up for root
+      mkdir -p /root/.kube
+      cp /etc/kubernetes/admin.conf /root/.kube/config
+      # Install Calico CNI
+      echo "[$(date)] head-init: installing Calico..."
+      export KUBECONFIG=/etc/kubernetes/admin.conf
+      kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.2/manifests/tigera-operator.yaml 2>&1 || true
+      # Wait briefly for the operator CRDs to register
+      sleep 10
+      # Apply Calico Installation CR
+      cat <<CALICOEOF | kubectl apply -f - 2>&1
+      apiVersion: operator.tigera.io/v1
+      kind: Installation
+      metadata:
+        name: default
+      spec:
+        calicoNetwork:
+          ipPools:
+          - name: default-ipv4-ippool
+            blockSize: 26
+            cidr: ${POD_CIDR}
+            encapsulation: VXLANCrossSubnet
+            natOutgoing: Enabled
+            nodeSelector: all()
+      ---
+      apiVersion: operator.tigera.io/v1
+      kind: APIServer
+      metadata:
+        name: default
+      spec: {}
+      CALICOEOF
+      # Mark as done
+      mkdir -p /etc/kubernetes
+      touch "$STAMP"
+      echo "[$(date)] head-init: cluster initialised successfully"
+      echo "[$(date)] head-init: run 'kubectl get nodes' to verify"
+      SCRIPTEOF
+    - chmod 755 /target/usr/local/bin/k8s-head-init.sh
+
+    # Create systemd service for first-boot head-node init
+    - |
+      cat > /target/etc/systemd/system/k8s-head-init.service <<'SVCEOF'
+      [Unit]
+      Description=Initialise Kubernetes control-plane (head node)
+      After=network-online.target containerd.service
+      Wants=network-online.target
+      ConditionPathExists=!/etc/kubernetes/.head-init-done
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/k8s-head-init.sh
+      RemainAfterExit=true
+      TimeoutStartSec=600
+
+      [Install]
+      WantedBy=multi-user.target
+      SVCEOF
+
+    # Install ~/save-logs.sh for kube user
+    - |
+      cat > /target/home/kube/save-logs.sh <<'SLEOF'
+      #!/usr/bin/env bash
+      set -euo pipefail
+      if [ "$(id -u)" -ne 0 ]; then echo "Run with sudo"; exit 1; fi
+      USB_PART=$(blkid -t LABEL="CIDATA" -o device 2>/dev/null | head -1)
+      if [ -z "$USB_PART" ]; then
+        echo "ERROR: No USB partition with label CIDATA found."
+        echo "Make sure the install USB drive is plugged in."
+        exit 1
+      fi
+      MNT="/tmp/usb-logs-$$"
+      mkdir -p "$MNT"
+      if ! mount "$USB_PART" "$MNT" 2>/dev/null; then
+        echo "ERROR: Failed to mount $USB_PART"
+        exit 1
+      fi
+      trap 'sync; umount "$MNT" 2>/dev/null; rmdir "$MNT" 2>/dev/null' EXIT
+      LOGDIR="$MNT/boot-logs/$(hostname)/$(date +%Y%m%d-%H%M%S)"
+      mkdir -p "$LOGDIR"
+      echo "Saving logs to USB..."
+      journalctl --boot --no-pager > "$LOGDIR/journalctl-boot.log" 2>&1 || true
+      dmesg > "$LOGDIR/dmesg.log" 2>&1 || true
+      systemctl --failed --no-pager > "$LOGDIR/failed-services.log" 2>&1 || true
+      systemctl status k8s-head-init.service --no-pager > "$LOGDIR/k8s-head-init-status.log" 2>&1 || true
+      journalctl -u k8s-head-init.service --no-pager > "$LOGDIR/k8s-head-init-journal.log" 2>&1 || true
+      ip addr > "$LOGDIR/ip-addr.log" 2>&1 || true
+      ip route > "$LOGDIR/ip-route.log" 2>&1 || true
+      cat /etc/resolv.conf > "$LOGDIR/resolv.conf.log" 2>&1 || true
+      kubectl get nodes > "$LOGDIR/kubectl-nodes.log" 2>&1 || true
+      kubectl get pods -A > "$LOGDIR/kubectl-pods-all.log" 2>&1 || true
+      echo "Done. Logs saved. USB will be unmounted automatically."
+      ls -la "$LOGDIR"
+      SLEOF
+    - sed -i 's/^      //' /target/home/kube/save-logs.sh
+    - chmod 755 /target/home/kube/save-logs.sh
+    - chown 1000:1000 /target/home/kube/save-logs.sh
+
+    # Install boot-log-to-USB script
+    - |
+      cat > /target/usr/local/bin/save-boot-logs-usb.sh <<'BLOGEOF'
+      #!/usr/bin/env bash
+      set -euo pipefail
+      USB_PART=$(blkid -t LABEL="CIDATA" -o device 2>/dev/null | head -1)
+      if [ -z "$USB_PART" ]; then
+        echo "No CIDATA USB found, skipping boot log save"
+        exit 0
+      fi
+      MOUNT_DIR="/tmp/usb-bootlogs"
+      mkdir -p "$MOUNT_DIR"
+      mount "$USB_PART" "$MOUNT_DIR" || exit 1
+      LOGDIR="$MOUNT_DIR/boot-logs/$(hostname)/$(date +%Y%m%d-%H%M%S)"
+      mkdir -p "$LOGDIR"
+      journalctl --boot --no-pager > "$LOGDIR/journalctl-boot.log" 2>&1 || true
+      dmesg > "$LOGDIR/dmesg.log" 2>&1 || true
+      systemctl --failed --no-pager > "$LOGDIR/failed-services.log" 2>&1 || true
+      sync
+      umount "$MOUNT_DIR"
+      echo "Boot logs saved to $LOGDIR"
+      BLOGEOF
+    - sed -i 's/^      //' /target/usr/local/bin/save-boot-logs-usb.sh
+    - chmod 755 /target/usr/local/bin/save-boot-logs-usb.sh
+
+    # Systemd service to run boot-log save after boot completes
+    - |
+      cat > /target/etc/systemd/system/save-boot-logs-usb.service <<'SVCEOF'
+      [Unit]
+      Description=Save boot logs to USB if plugged in
+      After=multi-user.target
+
+      [Service]
+      Type=oneshot
+      ExecStartPre=/bin/sleep 30
+      ExecStart=/usr/local/bin/save-boot-logs-usb.sh
+      RemainAfterExit=true
+
+      [Install]
+      WantedBy=multi-user.target
+      SVCEOF
+
+    # Enable custom services via symlinks
+    - |
+      mkdir -p /target/etc/systemd/system/multi-user.target.wants
+      ln -sf /etc/systemd/system/k8s-head-init.service /target/etc/systemd/system/multi-user.target.wants/k8s-head-init.service
+      ln -sf /etc/systemd/system/save-boot-logs-usb.service /target/etc/systemd/system/multi-user.target.wants/save-boot-logs-usb.service
+
+    # --- Network-dependent section below ---
+    # Re-establish WiFi then verify DNS
+    - |
+      IFACE=$(ls /sys/class/net/ | grep -E '^wl' | head -1)
+      if [ -n "$IFACE" ]; then
+        printf 'network:\n  version: 2\n  wifis:\n    %s:\n      dhcp4: true\n      access-points:\n        "__WIFI_SSID__":\n          password: "__WIFI_PASSWORD__"\n' "$IFACE" > /etc/netplan/99-wifi-early.yaml
+        chmod 600 /etc/netplan/99-wifi-early.yaml
+        netplan apply 2>/dev/null || true
+        echo "Waiting for WiFi IP..." >&2
+        for i in $(seq 1 30); do
+          if ip addr show "$IFACE" | grep -q 'inet '; then echo "WiFi up" >&2; break; fi
+          sleep 2
+        done
+        ip addr show "$IFACE" >&2
+      fi
+      echo "Waiting for DNS..." >&2
+      for i in $(seq 1 30); do
+        if getent hosts archive.ubuntu.com >/dev/null 2>&1; then
+          echo "DNS working" >&2
+          break
+        fi
+        sleep 2
+      done
+      if ! getent hosts archive.ubuntu.com >/dev/null 2>&1; then
+        echo "WARNING: DNS not working after 60s, apt commands may fail" >&2
+      fi
+
+    # Set up bind mounts so chroot has working DNS + devices
+    - |
+      mount --bind /dev /target/dev
+      mount --bind /proc /target/proc
+      mount --bind /run /target/run
+      mount --bind /sys /target/sys
+
+    # Install containerd + Kubernetes packages
+    - |
+      set +e
+      echo "=== Installing containerd ===" >&2
+      for attempt in 1 2 3; do
+        chroot /target apt-get update -qq 2>&1 && break
+        echo "apt-get update attempt $attempt failed, retrying in 10s..." >&2
+        sleep 10
+      done
+      chroot /target apt-get install -y -qq containerd 2>&1
+      chroot /target mkdir -p /etc/containerd
+      chroot /target bash -c "containerd config default > /etc/containerd/config.toml" 2>&1
+      sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /target/etc/containerd/config.toml 2>/dev/null
+      chroot /target systemctl enable containerd 2>&1
+
+      echo "=== Adding Kubernetes apt repo ===" >&2
+      chroot /target mkdir -p /etc/apt/keyrings
+      chroot /target bash -c "curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg" 2>&1
+      cat > /target/etc/apt/sources.list.d/kubernetes.list <<REPOEOF
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /
+      REPOEOF
+
+      echo "=== Installing kubeadm, kubelet, kubectl ===" >&2
+      for attempt in 1 2 3; do
+        chroot /target apt-get update -qq 2>&1 && break
+        echo "apt-get update attempt $attempt failed, retrying in 10s..." >&2
+        sleep 10
+      done
+      chroot /target apt-get install -y -qq kubelet kubeadm kubectl 2>&1
+      chroot /target apt-mark hold kubelet kubeadm kubectl 2>&1
+      chroot /target systemctl enable kubelet 2>&1
+
+      # Report result
+      if chroot /target which kubeadm >/dev/null 2>&1; then
+        echo "=== Kubernetes packages installed successfully ===" >&2
+      else
+        echo "=== WARNING: Kubernetes packages NOT installed (DNS/network issue during install) ===" >&2
+        echo "=== Run node-setup.sh manually after boot to complete setup ===" >&2
+      fi
+      true
+
+    # Clean up bind mounts
+    - |
+      umount /target/sys 2>/dev/null || true
+      umount /target/run 2>/dev/null || true
+      umount /target/proc 2>/dev/null || true
+      umount /target/dev 2>/dev/null || true
+
+    # Copy install logs to USB drive for debugging
+    - |
+      USB_PART=$(blkid -t LABEL="CIDATA" -o device 2>/dev/null | head -1)
+      if [ -n "$USB_PART" ]; then
+        mkdir -p /tmp/usblogs
+        mount "$USB_PART" /tmp/usblogs 2>/dev/null || true
+        if mountpoint -q /tmp/usblogs; then
+          LOGDIR="/tmp/usblogs/install-logs/$(date +%Y%m%d-%H%M%S)"
+          mkdir -p "$LOGDIR"
+          cp /var/log/installer/*.log "$LOGDIR/" 2>/dev/null || true
+          cp /autoinstall.yaml "$LOGDIR/" 2>/dev/null || true
+          sync
+          umount /tmp/usblogs
+        fi
+      fi
