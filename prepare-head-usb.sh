@@ -25,12 +25,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib/usb-helpers.sh"
+
 UBUNTU_ISO="${UBUNTU_ISO:-}"
 WORK_DIR="/tmp/iso-repack-head"
 CIDATA_MOUNT="/mnt/cidata"
-
-# --- Helpers ---
-die() { echo "Error: $1" >&2; exit 1; }
 
 cleanup() {
   umount "$CIDATA_MOUNT" 2>/dev/null || true
@@ -38,9 +37,8 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Validation ---
-[[ $EUID -eq 0 ]] || die "Run as root: sudo bash $0 [/dev/sdX]"
-
-command -v xorriso >/dev/null 2>&1 || die "xorriso is required: sudo apt install xorriso"
+validate_root
+validate_command xorriso "sudo apt install xorriso"
 
 # Find USB drive — auto-detect if not specified
 if [[ $# -ge 1 ]]; then
@@ -71,29 +69,17 @@ fi
 [[ -b "$USB_DEV" ]] || die "$USB_DEV is not a block device"
 
 # Safety check — refuse to target the boot disk
-ROOT_DISK="$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null || true)"
-if [[ -n "$ROOT_DISK" && "$USB_DEV" == "/dev/$ROOT_DISK" ]]; then
-  die "$USB_DEV appears to be your boot disk. Refusing to continue."
-fi
+validate_not_boot_disk "$USB_DEV"
 
 # Find Ubuntu ISO
-if [[ -z "$UBUNTU_ISO" ]]; then
-  UBUNTU_ISO="$(find "$SCRIPT_DIR" -maxdepth 1 -name 'ubuntu-24.04*-live-server-amd64.iso' -print -quit 2>/dev/null || true)"
-fi
-[[ -n "$UBUNTU_ISO" && -f "$UBUNTU_ISO" ]] || die "Ubuntu Server ISO not found.
-  Download it from https://ubuntu.com/download/server and place it in $SCRIPT_DIR
-  or set UBUNTU_ISO=/path/to/file.iso"
+find_ubuntu_iso "$SCRIPT_DIR"
 
 # SSH key for worker auto-join (we need the PUBLIC key to install in authorized_keys)
 NODE_KEY_PUB="$SCRIPT_DIR/keys/node-join.pub"
-[[ -f "$NODE_KEY_PUB" ]] || die "SSH public key not found at $NODE_KEY_PUB — run: ssh-keygen -t ed25519 -f $SCRIPT_DIR/keys/node-join -N '' -C k8s-node-auto-join"
+validate_file "$NODE_KEY_PUB" "SSH public key not found at $NODE_KEY_PUB — run: ssh-keygen -t ed25519 -f $SCRIPT_DIR/keys/node-join -N '' -C k8s-node-auto-join"
 
 # Load secrets from secrets.env if it exists
-SECRETS_FILE="$SCRIPT_DIR/secrets.env"
-if [[ -f "$SECRETS_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$SECRETS_FILE"
-fi
+load_secrets "$SCRIPT_DIR/secrets.env"
 
 # Get WiFi credentials
 WIFI_SSID="${WIFI_SSID:-}"
@@ -194,8 +180,8 @@ PUB_KEY=$(cat "$NODE_KEY_PUB")
 RESTRICTED_KEY="command=\"kubeadm token create --print-join-command\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding ${PUB_KEY}"
 
 # Escape special chars for sed
-SAFE_HASH=$(printf '%s' "$PASSWORD_HASH" | sed 's/[&\/\$]/\\&/g')
-SAFE_KEY=$(printf '%s' "$RESTRICTED_KEY" | sed 's/[&\/\$]/\\&/g')
+SAFE_HASH=$(escape_for_sed "$PASSWORD_HASH")
+SAFE_KEY=$(escape_for_sed "$RESTRICTED_KEY")
 
 sed -e "s|__WIFI_SSID__|${WIFI_SSID}|g" \
     -e "s|__WIFI_PASSWORD__|${WIFI_PASSWORD}|g" \
@@ -213,35 +199,7 @@ sed '1,5d' "$WORK_DIR/extract/nocloud/user-data" > "$WORK_DIR/extract/nocloud/au
 # Rewrite GRUB menu: require explicit selection to wipe & install
 GRUB_CFG="$WORK_DIR/extract/boot/grub/grub.cfg"
 if [[ -f "$GRUB_CFG" ]]; then
-  cat > "$GRUB_CFG" <<'GRUBEOF'
-set default=0
-set timeout=30
-
-loadfont unicode
-
-set menu_color_normal=white/black
-set menu_color_highlight=black/light-gray
-
-menuentry "Boot from disk (no changes)" {
-        exit 0
-}
-menuentry "WIPE DISK & Install Kubernetes HEAD Node" {
-        set gfxpayload=keep
-        linux   /casper/vmlinuz  autoinstall ci.ds=nocloud ---
-        initrd  /casper/initrd
-}
-menuentry "WIPE DISK & Install Kubernetes HEAD Node (HWE kernel)" {
-        set gfxpayload=keep
-        linux   /casper/hwe-vmlinuz  autoinstall ci.ds=nocloud ---
-        initrd  /casper/hwe-initrd
-}
-grub_platform
-if [ "$grub_platform" = "efi" ]; then
-menuentry 'UEFI Firmware Settings' {
-        fwsetup
-}
-fi
-GRUBEOF
+  write_grub_cfg "$GRUB_CFG" "Install Kubernetes HEAD Node"
 fi
 
 # --- Step 3: Repack the ISO ---

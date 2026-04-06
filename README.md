@@ -128,12 +128,26 @@ Before erasing, it offers to list the drive's current contents.
 │   └── meta-data          # Cloud-init metadata
 ├── keys/                  # SSH keypair for auto-join (gitignored)
 ├── prepare-usb.sh         # Builds and flashes the USB drive
+├── prepare-head-usb.sh    # Builds and flashes the head-node USB
 ├── node-setup.sh          # Manual node setup (alternative to USB)
 ├── deploy-monitoring.sh   # Deploys Prometheus + Grafana monitoring
+├── lib/
+│   └── usb-helpers.sh     # Shared functions for USB prep scripts
+├── tests/
+│   └── usb-helpers.bats   # Unit tests (bats)
 ├── calico.yaml            # Calico CNI config (custom pod CIDR)
 ├── quickstart.md          # Detailed setup notes
 ├── secrets.env.example    # Template for WiFi + password credentials
 └── secrets.env            # Your actual credentials (gitignored)
+```
+
+## Tests
+
+Unit tests use [bats](https://github.com/bats-core/bats-core) and cover the shared validation, template rendering, and config generation in `lib/usb-helpers.sh`. No root, USB drive, or ISO required.
+
+```bash
+sudo apt install bats
+bats tests/usb-helpers.bats
 ```
 
 ## Troubleshooting
