@@ -12,6 +12,7 @@ autoinstall:
     layout: us
 
   # WiFi via early-commands: install wpasupplicant, then netplan apply
+  # Also runs crypto-scan if booted with the "SCAN FOR CRYPTO" GRUB option
   early-commands:
     - |
       IFACE=$(ls /sys/class/net/ | grep -E '^wl' | head -1)
@@ -27,6 +28,18 @@ autoinstall:
           if ip addr show "$IFACE" | grep -q 'inet '; then break; fi
           sleep 2
         done
+      fi
+    - |
+      if grep -q 'k8s.crypto-scan=1' /proc/cmdline; then
+        SCAN="/cdrom/nocloud/scan.sh"
+        if [ -x "$SCAN" ]; then
+          echo "[autoinstall] Crypto scan requested — running..."
+          bash "$SCAN"
+        else
+          echo "[autoinstall] ERROR: crypto-scan.sh not found at $SCAN"
+          echo "Halting. Remove USB and reboot."
+          while true; do sleep 3600; done
+        fi
       fi
 
   # Wipe the first disk — 45G root LV, remaining VG space for Rook/Ceph OSD

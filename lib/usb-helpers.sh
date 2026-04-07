@@ -115,9 +115,19 @@ menuentry "WIPE DISK & ${label}" {
         linux   /casper/vmlinuz  autoinstall ci.ds=nocloud ---
         initrd  /casper/initrd
 }
+menuentry "SCAN FOR CRYPTO then WIPE & ${label}" {
+        set gfxpayload=keep
+        linux   /casper/vmlinuz  autoinstall ci.ds=nocloud k8s.crypto-scan=1 ---
+        initrd  /casper/initrd
+}
 menuentry "WIPE DISK & ${label} (HWE kernel)" {
         set gfxpayload=keep
         linux   /casper/hwe-vmlinuz  autoinstall ci.ds=nocloud ---
+        initrd  /casper/hwe-initrd
+}
+menuentry "SCAN FOR CRYPTO then WIPE & ${label} (HWE)" {
+        set gfxpayload=keep
+        linux   /casper/hwe-vmlinuz  autoinstall ci.ds=nocloud k8s.crypto-scan=1 ---
         initrd  /casper/hwe-initrd
 }
 grub_platform

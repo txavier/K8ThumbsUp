@@ -196,6 +196,10 @@ echo "  user-data (with key + WiFi injected)"
 
 cp "$SCRIPT_DIR/autoinstall/meta-data" "$WORK_DIR/extract/nocloud/meta-data"
 
+# Copy crypto scan script into the ISO
+cp "$SCRIPT_DIR/scan.sh" "$WORK_DIR/extract/nocloud/scan.sh"
+chmod 755 "$WORK_DIR/extract/nocloud/scan.sh"
+
 # Generate autoinstall.yaml (same as user-data but without the #cloud-config header comments)
 sed '1,5d' "$WORK_DIR/extract/nocloud/user-data" > "$WORK_DIR/extract/nocloud/autoinstall.yaml"
 
