@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8thumbsup-dev
+  labels:
+    app: k8thumbsup
+    environment: development
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: git-data-pvc
+  namespace: k8thumbsup-dev
+  labels:
+    app: k8thumbsup
+    component: dev-sandbox
+spec:
+  storageClassName: nfs
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dev-sandbox
+  namespace: k8thumbsup-dev
+  labels:
+    app: k8thumbsup
+    component: dev-sandbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8thumbsup
+      component: dev-sandbox
+  template:
+    metadata:
+      labels:
+        app: k8thumbsup
+        component: dev-sandbox
+    spec:
+      containers:
+        - name: dev-sandbox
+          image: 192.168.87.35:5000/k8thumbsup-dev-sandbox:latest
+          stdin: true
+          tty: true
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: workspace
+              mountPath: /home/user/.vscode-server
+              subPath: .vscode-server
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: git-data-pvc
