@@ -21,6 +21,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/usb-helpers.sh"
 
+# Load build config (Ceph storage reservation, LV size, etc.)
+if [[ -f "$SCRIPT_DIR/config.env" ]]; then
+  source "$SCRIPT_DIR/config.env"
+fi
+RESERVE_CEPH_STORAGE="${RESERVE_CEPH_STORAGE:-true}"
+ROOT_LV_SIZE="${ROOT_LV_SIZE:-45G}"
+if [[ "$RESERVE_CEPH_STORAGE" != "true" ]]; then
+  ROOT_LV_SIZE="-1"
+fi
+
 UBUNTU_ISO="${UBUNTU_ISO:-}"
 WORK_DIR="/tmp/iso-repack"
 CIDATA_MOUNT="/mnt/cidata"
@@ -191,8 +201,10 @@ sed -e "s|      __NODE_JOIN_KEY_PLACEHOLDER__|${KEY_CONTENT//$'\n'/\\n}|" \
     -e "s|__PASSWORD_HASH__|${SAFE_HASH}|g" \
     -e "s|__MASTER_IP__|${MASTER_IP}|g" \
     -e "s|__MASTER_USER__|${MASTER_USER}|g" \
+    -e "s|__ROOT_LV_SIZE__|${ROOT_LV_SIZE}|g" \
   "$SCRIPT_DIR/autoinstall/user-data" > "$WORK_DIR/extract/nocloud/user-data"
 echo "  user-data (with key + WiFi injected)"
+echo "  Root LV size: $ROOT_LV_SIZE (RESERVE_CEPH_STORAGE=$RESERVE_CEPH_STORAGE)"
 
 cp "$SCRIPT_DIR/autoinstall/meta-data" "$WORK_DIR/extract/nocloud/meta-data"
 

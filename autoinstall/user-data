@@ -42,7 +42,8 @@ autoinstall:
         fi
       fi
 
-  # Wipe the first disk — 45G root LV, remaining VG space for Rook/Ceph OSD
+  # Wipe the first disk — root LV size set by __ROOT_LV_SIZE__ (config.env)
+  # Use -1 to fill VG, or e.g. 45G to reserve remaining space for Rook/Ceph OSD
   storage:
     swap:
       size: 0
@@ -57,7 +58,7 @@ autoinstall:
       - {id: boot-fmt, type: format, volume: boot-part, fstype: ext4}
       - {id: vg0, type: lvm_volgroup, name: ubuntu-vg, devices: [lvm-part]}
       - {id: lv-root, type: lvm_partition, volgroup: vg0,
-         name: ubuntu-lv, size: 45G}
+         name: ubuntu-lv, size: __ROOT_LV_SIZE__}
       - {id: root-fmt, type: format, volume: lv-root, fstype: ext4}
       - {id: mnt-root, type: mount, device: root-fmt, path: /}
       - {id: mnt-boot, type: mount, device: boot-fmt, path: /boot}
