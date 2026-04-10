@@ -77,3 +77,21 @@ bash deploy-monitoring.sh
 | `quickstart.md` | Detailed step-by-step worker provisioning guide |
 | `quickstart-head.md` | Step-by-step head node setup guide |
 | `grafana-readme.md` | Grafana dashboards, access, redeployment |
+
+## USB Log Locations
+
+Install and boot logs are saved to the USB drive in two places:
+
+| USB Path | Source | When Written |
+|---|---|---|
+| `CIDATA:/install-logs/<timestamp>/` | `backup-logs-usb.sh` | Manually — run from a recovery shell if autoinstall fails (copies `/var/log/installer/*.log`, `/var/log/syslog`, `/autoinstall.yaml`) |
+| `CIDATA:/boot-logs/<hostname>/<timestamp>/` | `save-boot-logs-usb.service` | Automatically — 30s after first boot if USB is still plugged in (copies `journalctl --boot`, `dmesg`, failed services) |
+| `writable:/install-logs-<date>.<n>/log/installer/` | Ubuntu installer | Automatically — written by the live installer to the USB's writable partition during autoinstall |
+| `writable:/install-logs-<date>.<n>/crash/` | Ubuntu installer | Automatically — crash reports written if subiquity crashes during autoinstall |
+
+Key log files inside `writable:/install-logs-*/log/installer/`:
+- `subiquity-traceback.txt` — Python traceback if subiquity crashed (check this first)
+- `subiquity-server-debug.log` — detailed autoinstall server log
+- `curtin-install.log` — disk partitioning, package install, GRUB setup
+
+**Note:** The machine's clock affects the date in `writable` log directory names. If the BIOS clock is wrong (e.g. `install-logs-2020-01-09.1`), sort by filesystem modification time (`ls -lt`) to find the most recent attempt.
