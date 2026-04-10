@@ -23,11 +23,13 @@ Automated Kubernetes cluster provisioning via bootable USB. Insert a USB drive i
 |---|---|
 | `prepare-usb.sh` | Build bootable USB: extract ISO, inject config, repack, write to drive |
 | `prepare-head-usb.sh` | Same as above but for the head/master node |
+| `prepare-head-high-availability-usb.sh` | Build bootable USB for an HA control-plane node that joins an existing cluster |
 | `node-setup.sh` | Manual alternative — run on a fresh Ubuntu 24.04 box to prepare it as a worker |
 | `auto-join.sh` | First-boot script: SSH to master for join token, run `kubeadm join` |
 | `deploy-monitoring.sh` | Deploy kube-prometheus-stack (Grafana on NodePort 30300) |
 | `autoinstall/user-data` | Cloud-init autoinstall template for worker nodes |
 | `autoinstall/head-user-data` | Cloud-init autoinstall template for head/master node |
+| `autoinstall/ha-head-user-data` | Cloud-init autoinstall template for HA control-plane node |
 | `lib/usb-helpers.sh` | Shared helper functions for USB preparation scripts |
 | `calico.yaml` | Calico CNI manifest (pod CIDR: 192.172.0.0/16) |
 
