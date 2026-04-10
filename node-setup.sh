@@ -48,7 +48,7 @@ sysctl --system >/dev/null 2>&1
 
 echo "=== [5/9] Installing containerd ==="
 apt-get update -qq
-apt-get install -y -qq containerd >/dev/null
+apt-get install -y -qq containerd=1.7.28-* >/dev/null
 mkdir -p /etc/containerd
 containerd config default > /etc/containerd/config.toml
 # Enable systemd cgroup driver

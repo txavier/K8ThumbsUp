@@ -364,7 +364,7 @@ autoinstall:
         echo "apt-get update attempt $attempt failed, retrying in 10s..." >&2
         sleep 10
       done
-      chroot /target apt-get install -y -qq containerd 2>&1
+      chroot /target apt-get install -y -qq containerd=1.7.28-* 2>&1
       chroot /target mkdir -p /etc/containerd
       chroot /target bash -c "containerd config default > /etc/containerd/config.toml" 2>&1
       sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /target/etc/containerd/config.toml 2>/dev/null

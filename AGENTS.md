@@ -60,7 +60,8 @@ bash deploy-monitoring.sh
 
 ## Conventions
 
-- **Kubernetes 1.35** on **Ubuntu 24.04 LTS** with **containerd** as the runtime
+- **Kubernetes 1.35** on **Ubuntu 24.04 LTS** with **containerd 1.7.28** as the runtime
+- **Version pinning**: All component version numbers (containerd, kubeadm, kubelet, kubectl, runc, etc.) must remain consistent across every script and config file unless the user explicitly agrees to a version change. If a version is updated, alert the user that all existing nodes must be reimaged or upgraded to match the new version to avoid cluster inconsistencies.
 - Shell scripts use `set -euo pipefail` and are written for bash
 - Autoinstall late-commands: file-write operations come first (before chroot/apt), because subiquity stops on failure
 - Laptop lid close is set to `ignore` (nodes stay awake on battery) via `logind.conf.d/lid.conf`
