@@ -201,10 +201,8 @@ sed -e "s|      __NODE_JOIN_KEY_PLACEHOLDER__|${KEY_CONTENT//$'\n'/\\n}|" \
     -e "s|__PASSWORD_HASH__|${SAFE_HASH}|g" \
     -e "s|__MASTER_IP__|${MASTER_IP}|g" \
     -e "s|__MASTER_USER__|${MASTER_USER}|g" \
-    -e "s|__ROOT_LV_SIZE__|${ROOT_LV_SIZE}|g" \
   "$SCRIPT_DIR/autoinstall/user-data" > "$WORK_DIR/extract/nocloud/user-data"
 echo "  user-data (with key + WiFi injected)"
-echo "  Root LV size: $ROOT_LV_SIZE (RESERVE_CEPH_STORAGE=$RESERVE_CEPH_STORAGE)"
 
 cp "$SCRIPT_DIR/autoinstall/meta-data" "$WORK_DIR/extract/nocloud/meta-data"
 

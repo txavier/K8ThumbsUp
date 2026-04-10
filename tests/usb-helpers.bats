@@ -182,6 +182,16 @@ EOF
   grep -q 'fwsetup' "$TEST_TMP/grub.cfg"
 }
 
+# ─── autoinstall user-data: storage layout ──────────────────────────────
+
+@test "worker user-data uses layout-based storage (BIOS+UEFI compatible)" {
+  grep -q 'name: lvm' "$REPO_DIR/autoinstall/user-data"
+}
+
+@test "worker user-data does not hardcode EFI partition" {
+  ! grep -q 'flag: boot' "$REPO_DIR/autoinstall/user-data"
+}
+
 # ─── find_ubuntu_iso ────────────────────────────────────────────────────
 
 @test "find_ubuntu_iso finds ISO by glob pattern" {

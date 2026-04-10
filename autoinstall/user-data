@@ -42,27 +42,15 @@ autoinstall:
         fi
       fi
 
-  # Wipe the first disk — root LV size set by __ROOT_LV_SIZE__ (config.env)
-  # Use -1 to fill VG, or e.g. 45G to reserve remaining space for Rook/Ceph OSD
+  # Wipe the largest disk and install with LVM.
+  # Boot partition type (EFI vs BIOS) is auto-detected by subiquity.
+  # When RESERVE_CEPH_STORAGE=true, a late-command resizes the root LV
+  # to __ROOT_LV_SIZE__ so the remaining VG space is available for Rook/Ceph OSD.
   storage:
-    swap:
-      size: 0
-    config:
-      - {id: disk0, type: disk, ptable: gpt, wipe: superblock-recursive,
-         grub_device: false, match: {size: largest}}
-      - {id: efi-part, type: partition, device: disk0, size: 1G,
-         flag: boot, grub_device: true}
-      - {id: boot-part, type: partition, device: disk0, size: 2G}
-      - {id: lvm-part, type: partition, device: disk0, size: -1}
-      - {id: efi-fmt, type: format, volume: efi-part, fstype: fat32}
-      - {id: boot-fmt, type: format, volume: boot-part, fstype: ext4}
-      - {id: vg0, type: lvm_volgroup, name: ubuntu-vg, devices: [lvm-part]}
-      - {id: lv-root, type: lvm_partition, volgroup: vg0,
-         name: ubuntu-lv, size: __ROOT_LV_SIZE__}
-      - {id: root-fmt, type: format, volume: lv-root, fstype: ext4}
-      - {id: mnt-root, type: mount, device: root-fmt, path: /}
-      - {id: mnt-boot, type: mount, device: boot-fmt, path: /boot}
-      - {id: mnt-efi, type: mount, device: efi-fmt, path: /boot/efi}
+    layout:
+      name: lvm
+      match:
+        size: largest
 
   # Create a user — change password before use!
   # Generate a hash: mkpasswd --method=SHA-512 yourpassword
@@ -212,8 +200,9 @@ autoinstall:
       cat > /target/etc/systemd/system/k8s-auto-join.service <<'SVCEOF'
       [Unit]
       Description=Auto-join Kubernetes cluster
-      After=network-online.target
+      After=network-online.target containerd.service
       Wants=network-online.target
+      Requires=containerd.service
       ConditionPathExists=!/etc/kubernetes/.joined
 
       [Service]
