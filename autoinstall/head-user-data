@@ -65,6 +65,12 @@ autoinstall:
     - ca-certificates
     - gpg
     - apt-transport-https
+    - linux-firmware
+    - wpasupplicant
+    - iw
+    - wireless-tools
+    - linux-headers-generic
+    - dkms
 
   # Disable swap partition
   swap:
@@ -76,6 +82,11 @@ autoinstall:
   # because subiquity stops processing late-commands if any command fails.
   #
   late-commands:
+    # Install Realtek USB WiFi drivers (RTL8812AU/8821AU/8814AU) from multiverse
+    # These are common USB adapters not supported by the mainline kernel
+    - curtin in-target --target=/target -- add-apt-repository multiverse -y
+    - curtin in-target --target=/target -- apt-get install -y realtek-rtl88xxau-dkms
+
     # Persist WiFi config in the installed system
     - |
       WIFI_IFACE=$(ls /sys/class/net/ | grep -E '^wl' | head -1)

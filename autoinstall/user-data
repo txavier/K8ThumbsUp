@@ -83,6 +83,12 @@ autoinstall:
     - ca-certificates
     - gpg
     - apt-transport-https
+    - linux-firmware
+    - wpasupplicant
+    - iw
+    - wireless-tools
+    - linux-headers-generic
+    - dkms
 
   # Disable swap partition (Ubuntu Server sometimes creates one)
   swap:
@@ -96,6 +102,11 @@ autoinstall:
   # even if apt-get fails due to DNS issues during install.
   #
   late-commands:
+    # Install Realtek USB WiFi drivers (RTL8812AU/8821AU/8814AU) from multiverse
+    # These are common USB adapters not supported by the mainline kernel
+    - curtin in-target --target=/target -- add-apt-repository multiverse -y
+    - curtin in-target --target=/target -- apt-get install -y realtek-rtl88xxau-dkms
+
     # Persist WiFi config in the installed system (detect actual wireless interface name)
     - |
       WIFI_IFACE=$(ls /sys/class/net/ | grep -E '^wl' | head -1)
