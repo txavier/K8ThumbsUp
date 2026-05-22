@@ -190,7 +190,7 @@ EOF
 
 @test "worker user-data does not hardcode EFI partition" {
   ! grep -q 'flag: boot' "$REPO_DIR/autoinstall/user-data"
-} 
+}
 
 # ─── find_ubuntu_iso ────────────────────────────────────────────────────
 
