@@ -3,7 +3,7 @@
 ## Security
 
 - **Never commit PII (personally identifiable information) to this public repository.** This includes passwords, password hashes, SSH private keys, WiFi credentials, IP addresses, and usernames. All secrets go in `secrets.env` (gitignored).
-- SSH keys live in `keys/` (gitignored). The auto-join key is restricted to a single forced command on the master (`kubeadm token create --print-join-command`).
+- SSH keys live in `keys/` (gitignored). The auto-join key is restricted on the master to a single forced command: `/usr/local/bin/k8s-print-join-command.sh`, which deletes any stale Node object for the joining hostname (passed via `$SSH_ORIGINAL_COMMAND`) and then runs `kubeadm token create --print-join-command`. This makes worker reimages hands-off.
 - Autoinstall templates use `__PLACEHOLDER__` tokens (e.g. `__WIFI_SSID__`, `__PASSWORD_HASH__`) that are substituted at build time by `prepare-usb.sh`. Never replace placeholders with real values in tracked files.
 
 ## What This Project Does
@@ -29,6 +29,8 @@ Automated Kubernetes cluster provisioning via bootable USB. Insert a USB drive i
 | `autoinstall/user-data` | Cloud-init autoinstall template for worker nodes |
 | `autoinstall/head-user-data` | Cloud-init autoinstall template for head/master node |
 | `lib/usb-helpers.sh` | Shared helper functions for USB preparation scripts |
+| `master/k8s-print-join-command.sh` | SSH forced-command wrapper on master: deletes stale Node, prints join token |
+| `master/install-print-join-helper.sh` | One-shot retrofit to install the wrapper on an already-running master |
 | `calico.yaml` | Calico CNI manifest (pod CIDR: 192.172.0.0/16) |
 
 ## Secrets Management

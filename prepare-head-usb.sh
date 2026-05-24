@@ -27,6 +27,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/usb-helpers.sh"
 
+# Load build config (includes OFFLINE_PACKAGES)
+if [[ -f "$SCRIPT_DIR/config.env" ]]; then
+  source "$SCRIPT_DIR/config.env"
+fi
+
 UBUNTU_ISO="${UBUNTU_ISO:-}"
 WORK_DIR="/tmp/iso-repack-head"
 CIDATA_MOUNT="/mnt/cidata"
@@ -175,9 +180,11 @@ echo "=== [2/5] Injecting autoinstall config (head node) ==="
 # Create NoCloud datasource directory inside the ISO
 mkdir -p "$WORK_DIR/extract/nocloud"
 
-# Build the authorized_keys line — restrict to kubeadm token command only
+# Build the authorized_keys line — restrict to the print-join wrapper, which
+# (a) deletes any stale Node object for the joining hostname, then
+# (b) prints a fresh `kubeadm join` command.
 PUB_KEY=$(cat "$NODE_KEY_PUB")
-RESTRICTED_KEY="command=\"kubeadm token create --print-join-command\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding ${PUB_KEY}"
+RESTRICTED_KEY="command=\"/usr/local/bin/k8s-print-join-command.sh\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding ${PUB_KEY}"
 
 # Escape special chars for sed
 SAFE_HASH=$(escape_for_sed "$PASSWORD_HASH")
@@ -206,9 +213,15 @@ if [[ -f "$GRUB_CFG" ]]; then
   write_grub_cfg "$GRUB_CFG" "Install Kubernetes HEAD Node"
 fi
 
-# --- Step 3: Repack the ISO ---
+# --- Step 3: Pre-download offline packages ---
 echo ""
-echo "=== [3/5] Repacking ISO with xorriso ==="
+echo "=== [3/6] Pre-downloading offline packages ==="
+IFS=' ' read -ra _offline_pkgs <<< "${OFFLINE_PACKAGES:-}"
+download_offline_packages "$WORK_DIR/extract/drivers" "${_offline_pkgs[@]}"
+
+# --- Step 4: Repack the ISO ---
+echo ""
+echo "=== [4/6] Repacking ISO with xorriso ==="
 ISO_OUT="$WORK_DIR/ubuntu-autoinstall-head.iso"
 xorriso -as mkisofs \
   -r -V 'Ubuntu-Server 24.04.4 LTS amd64' \
@@ -229,13 +242,13 @@ echo "  ISO created: $ISO_OUT"
 
 # --- Step 4: Write ISO to USB with dd ---
 echo ""
-echo "=== [4/5] Writing ISO to USB ==="
+echo "=== [5/6] Writing ISO to USB ==="
 umount "${USB_DEV}"* 2>/dev/null || true
 dd if="$ISO_OUT" of="$USB_DEV" bs=4M status=progress conv=fsync 2>&1
 
 # --- Step 5: Create CIDATA partition ---
 echo ""
-echo "=== [5/5] Creating CIDATA partition ==="
+echo "=== [6/6] Creating CIDATA partition ==="
 sgdisk -e "$USB_DEV"
 
 # Find where the existing partitions end

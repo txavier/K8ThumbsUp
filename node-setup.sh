@@ -48,6 +48,7 @@ sysctl --system >/dev/null 2>&1
 
 echo "=== [5/9] Installing containerd ==="
 apt-get update -qq
+apt-get install -y -qq linux-image-6.8.0-107-generic linux-headers-6.8.0-107-generic linux-modules-extra-6.8.0-107-generic >/dev/null
 apt-get install -y -qq containerd >/dev/null
 mkdir -p /etc/containerd
 containerd config default > /etc/containerd/config.toml

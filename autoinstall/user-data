@@ -87,7 +87,9 @@ autoinstall:
     - wpasupplicant
     - iw
     - wireless-tools
-    - linux-headers-generic
+    - linux-image-6.8.0-107-generic
+    - linux-headers-6.8.0-107-generic
+    - linux-modules-extra-6.8.0-107-generic
     - dkms
 
   # Disable swap partition (Ubuntu Server sometimes creates one)

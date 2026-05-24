@@ -139,7 +139,8 @@ autoinstall:
     # Disable cloud-init on the installed system
     - mkdir -p /target/etc/cloud && touch /target/etc/cloud/cloud-init.disabled
 
-    # Install SSH public key for worker auto-join (restricted to kubeadm token command)
+    # Install SSH public key for worker auto-join (restricted to the
+    # print-join wrapper script installed below)
     - |
       mkdir -p /target/home/kube/.ssh
       cat > /target/home/kube/.ssh/authorized_keys <<'AUTHEOF'
@@ -149,6 +150,34 @@ autoinstall:
     - chmod 700 /target/home/kube/.ssh
     - chmod 600 /target/home/kube/.ssh/authorized_keys
     - chown -R 1000:1000 /target/home/kube/.ssh
+
+    # Install the print-join-command wrapper.  When a worker SSHes in, the
+    # forced-command in authorized_keys runs this script.  It deletes any
+    # stale Node object whose name matches the joining worker's hostname
+    # (passed via SSH_ORIGINAL_COMMAND), then prints a fresh join command.
+    # This lets workers be reimaged without manual `kubectl delete node`.
+    - |
+      cat > /target/usr/local/bin/k8s-print-join-command.sh <<'PJCEOF'
+      #!/usr/bin/env bash
+      set -euo pipefail
+      KUBECONFIG="${KUBECONFIG:-/home/kube/.kube/config}"
+      LOG_TAG="k8s-print-join-command"
+      requested="${SSH_ORIGINAL_COMMAND:-}"
+      if [[ "$requested" =~ ^k8s-node-[a-f0-9]{6}$ ]]; then
+        if kubectl --kubeconfig="$KUBECONFIG" get node "$requested" >/dev/null 2>&1; then
+          echo "[$LOG_TAG] deleting stale node object: $requested" >&2
+          kubectl --kubeconfig="$KUBECONFIG" delete node "$requested" \
+            --ignore-not-found --wait=false >&2 || \
+            echo "[$LOG_TAG] WARN: kubectl delete node $requested failed" >&2
+        fi
+      elif [[ -n "$requested" ]]; then
+        echo "[$LOG_TAG] WARN: ignoring unexpected SSH_ORIGINAL_COMMAND: $requested" >&2
+      fi
+      exec kubeadm token create --print-join-command
+      PJCEOF
+    - sed -i 's/^      //' /target/usr/local/bin/k8s-print-join-command.sh
+    - chmod 755 /target/usr/local/bin/k8s-print-join-command.sh
+    - chown root:root /target/usr/local/bin/k8s-print-join-command.sh
 
     # Install kubeadm-init script (runs on first boot to initialise the cluster)
     - |
@@ -383,10 +412,28 @@ autoinstall:
 
       echo "=== Adding Kubernetes apt repo ===" >&2
       chroot /target mkdir -p /etc/apt/keyrings
-      chroot /target bash -c "curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg" 2>&1
-      cat > /target/etc/apt/sources.list.d/kubernetes.list <<REPOEOF
-      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /
-      REPOEOF
+      # Fetch with -4 (avoid IPv6 hangs on AAAA-only DNS), retry, and refuse to
+      # install a 0-byte keyring \u2014 that would poison apt-get update with NO_PUBKEY.
+      KEYRING_OK=0
+      for attempt in 1 2 3; do
+        rm -f /target/tmp/k8s-release.key /target/tmp/k8s-release.gpg
+        if chroot /target bash -c 'curl -4 -fsSL --max-time 30 -o /tmp/k8s-release.key https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key && [ -s /tmp/k8s-release.key ] && gpg --dearmor -o /tmp/k8s-release.gpg /tmp/k8s-release.key && [ -s /tmp/k8s-release.gpg ]' 2>&1; then
+          mv /target/tmp/k8s-release.gpg /target/etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          chmod 0644 /target/etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          rm -f /target/tmp/k8s-release.key
+          KEYRING_OK=1
+          break
+        fi
+        echo "keyring fetch attempt $attempt failed, retrying in 10s..." >&2
+        sleep 10
+      done
+      if [ "$KEYRING_OK" = 1 ]; then
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /" \
+          > /target/etc/apt/sources.list.d/kubernetes.list
+      else
+        echo "=== ERROR: kubernetes keyring fetch failed (head node has no auto-join fallback) ===" >&2
+        rm -f /target/etc/apt/keyrings/kubernetes-apt-keyring.gpg /target/etc/apt/sources.list.d/kubernetes.list
+      fi
 
       echo "=== Installing kubeadm, kubelet, kubectl ===" >&2
       for attempt in 1 2 3; do

@@ -182,6 +182,18 @@ EOF
   grep -q 'fwsetup' "$TEST_TMP/grub.cfg"
 }
 
+@test "write_grub_cfg in TEST_MODE auto-selects install with short timeout" {
+  TEST_MODE=1 write_grub_cfg "$TEST_TMP/grub.cfg" "Install Kubernetes Node"
+  grep -q 'set default=1' "$TEST_TMP/grub.cfg"
+  grep -q 'set timeout=5' "$TEST_TMP/grub.cfg"
+}
+
+@test "write_grub_cfg without TEST_MODE defaults to safe boot-from-disk" {
+  write_grub_cfg "$TEST_TMP/grub.cfg" "Install Kubernetes Node"
+  grep -q 'set default=0' "$TEST_TMP/grub.cfg"
+  grep -q 'set timeout=30' "$TEST_TMP/grub.cfg"
+}
+
 # ─── find_ubuntu_iso ────────────────────────────────────────────────────
 
 @test "find_ubuntu_iso finds ISO by glob pattern" {

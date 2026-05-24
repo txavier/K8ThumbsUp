@@ -69,11 +69,22 @@ Ubuntu + Kubernetes installed in one shot, no interaction needed.
    ```
    Or skip this — the script will prompt for anything missing.
 
-4. **Run the prep script** (extracts ISO, injects autoinstall, repacks, writes to USB):
+4. **Generate the SSH keypair** (first time only — skip if `keys/node-join` already exists):
+   ```bash
+   mkdir -p keys && ssh-keygen -t ed25519 -f keys/node-join -N '' -C k8s-node-auto-join
+   ```
+   > **Why is this needed?** When a worker node boots for the first time, it SSHes to the
+   > master using this private key to run `kubeadm token create --print-join-command`.
+   > The master accepts only this key and restricts it to that one command (forced command
+   > in `authorized_keys`). The private key is embedded in the worker USB;
+   > the public key goes on the master. See `prepare-head-usb.sh` for the master side.
+
+5. **Run the prep script** (extracts ISO, injects autoinstall, repacks, writes to USB):
    ```bash
    sudo bash prepare-usb.sh
    ```
    - Auto-detects the USB drive (or specify: `sudo bash prepare-usb.sh /dev/sdX`)
+   - Check which device is your USB first: `lsblk -o NAME,SIZE,TRAN,VENDOR,MODEL`
    - Shows drive info and offers to list current contents before erasing
    - Default login: `kube` / whatever password you provide
 

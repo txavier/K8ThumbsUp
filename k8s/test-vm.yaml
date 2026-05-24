@@ -1,0 +1,123 @@
+# KubeVirt smoke-test VM for the K8ThumbsUp autoinstall ISO.
+#
+# Boots the freshly built /tmp/iso-repack/ubuntu-autoinstall.iso as a CD-ROM
+# and installs Ubuntu onto a blank 60 GiB virtio disk, exercising the same
+# subiquity autoinstall path that real worker laptops use.
+#
+# Caveats vs. real hardware:
+#   - virtio NIC ("enp1s0") satisfies network without WiFi, so the WiFi
+#     netplan / RTL8812AU driver paths are skipped (no `wl*` interface).
+#   - You must manually select "Install Kubernetes Node" in GRUB via VNC,
+#     or the VM will sit on the default "Boot from disk" entry.
+#   - If the VM reaches the master at __MASTER_IP__ it WILL join the real
+#     cluster.  Delete it with `kubectl delete node <hostname>` afterwards
+#     or run this against an isolated/test master.
+#
+# Apply:
+#   bash k8s/test-vm-up.sh         # serves ISO over HTTP + applies this manifest
+#   virtctl vnc -n k8thumbsup-test k8thumbsup-worker
+#
+# Tear down:
+#   kubectl delete -n k8thumbsup-test vm/k8thumbsup-worker
+#   kubectl delete -n k8thumbsup-test dv/k8thumbsup-iso dv/k8thumbsup-disk
+#   kubectl delete namespace k8thumbsup-test
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8thumbsup-test
+---
+# Empty 60 GiB target disk.  Must be > __ROOT_LV_SIZE__ in config.env (45 GiB)
+# plus boot/EFI partitions.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: k8thumbsup-disk
+  namespace: k8thumbsup-test
+spec:
+  source:
+    blank: {}
+  pvc:
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 60Gi
+    storageClassName: longhorn-single
+---
+# Installer ISO.  CDI imports it via HTTP from a transient server started
+# by test-vm-up.sh on the host running the script (laptop on the same LAN).
+# The __ISO_URL__ placeholder is substituted at apply time.
+#
+# We use local-path (filesystem volumeMode) here instead of Longhorn block;
+# block-mode PVCs force qemu-img to write the full requested size as raw,
+# which on a 5 GiB Longhorn volume takes ~90 minutes vs ~2 minutes on a
+# sparse qcow2 file on local-path.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: k8thumbsup-iso
+  namespace: k8thumbsup-test
+  annotations:
+    # Force CDI to bind the PVC immediately and run the importer, instead of
+    # honoring local-path's WaitForFirstConsumer (which would deadlock: the VM
+    # only starts after the ISO is imported).
+    cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+spec:
+  source:
+    http:
+      url: __ISO_URL__
+  pvc:
+    accessModes: [ReadWriteOnce]
+    volumeMode: Filesystem
+    resources:
+      requests:
+        storage: 5Gi
+    storageClassName: local-path
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: k8thumbsup-worker
+  namespace: k8thumbsup-test
+spec:
+  runStrategy: RerunOnFailure
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: k8thumbsup-worker
+    spec:
+      domain:
+        cpu:
+          cores: 2
+        memory:
+          guest: 4Gi
+        firmware:
+          bootloader:
+            efi:
+              secureBoot: false
+        devices:
+          disks:
+            - name: installer
+              cdrom:
+                bus: sata
+              bootOrder: 1
+            - name: target
+              disk:
+                bus: virtio
+              bootOrder: 2
+          interfaces:
+            - name: default
+              masquerade: {}
+        machine:
+          type: q35
+      networks:
+        - name: default
+          pod: {}
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: installer
+          dataVolume:
+            name: k8thumbsup-iso
+        - name: target
+          dataVolume:
+            name: k8thumbsup-disk

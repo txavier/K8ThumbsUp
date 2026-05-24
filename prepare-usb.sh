@@ -46,8 +46,15 @@ trap cleanup EXIT
 validate_root
 validate_command xorriso "sudo apt install xorriso"
 
+# In BUILD_ISO_ONLY mode we only need to produce $WORK_DIR/ubuntu-autoinstall.iso
+# (used by the KubeVirt smoke test).  Skip USB detection, dd, and CIDATA.
+BUILD_ISO_ONLY="${BUILD_ISO_ONLY:-0}"
+
 # Find USB drive — auto-detect if not specified
-if [[ $# -ge 1 ]]; then
+if [[ "$BUILD_ISO_ONLY" == "1" ]]; then
+  USB_DEV=""
+  echo "BUILD_ISO_ONLY=1 — skipping USB device selection."
+elif [[ $# -ge 1 ]]; then
   USB_DEV="$1"
 else
   # Find removable USB block devices (exclude the boot disk)
@@ -72,10 +79,10 @@ else
   fi
 fi
 
-[[ -b "$USB_DEV" ]] || die "$USB_DEV is not a block device"
+[[ -n "$USB_DEV" && ! -b "$USB_DEV" ]] && die "$USB_DEV is not a block device"
 
 # Safety check — refuse to target the boot disk
-validate_not_boot_disk "$USB_DEV"
+[[ -n "$USB_DEV" ]] && validate_not_boot_disk "$USB_DEV"
 
 # Find Ubuntu ISO
 find_ubuntu_iso "$SCRIPT_DIR"
@@ -124,35 +131,42 @@ fi
 echo "============================================"
 echo "  Kubernetes Node USB Prep"
 echo "============================================"
-echo "  USB device : $USB_DEV"
-echo "  USB size   : $(lsblk -dno SIZE "$USB_DEV" 2>/dev/null | xargs)"
-echo "  USB model  : $(lsblk -dno MODEL "$USB_DEV" 2>/dev/null | xargs)"
+if [[ "$BUILD_ISO_ONLY" == "1" ]]; then
+  echo "  Mode       : BUILD_ISO_ONLY (no USB write)"
+else
+  echo "  USB device : $USB_DEV"
+  echo "  USB size   : $(lsblk -dno SIZE "$USB_DEV" 2>/dev/null | xargs)"
+  echo "  USB model  : $(lsblk -dno MODEL "$USB_DEV" 2>/dev/null | xargs)"
+fi
 echo "  Ubuntu ISO : $(basename "$UBUNTU_ISO")"
+echo "  TEST_MODE  : ${TEST_MODE:-0}"
 echo "============================================"
 echo ""
-echo "WARNING: This will ERASE ALL DATA on $USB_DEV"
-read -r -p "List contents before erasing? (y/N): " list_confirm
-if [[ "$list_confirm" =~ ^[Yy]$ ]]; then
-  echo ""
-  for part in "${USB_DEV}"* "${USB_DEV}p"*; do
-    [[ -b "$part" && "$part" != "$USB_DEV" ]] || continue
-    label=$(lsblk -no LABEL "$part" 2>/dev/null | xargs)
-    fstype=$(lsblk -no FSTYPE "$part" 2>/dev/null | xargs)
-    size=$(lsblk -no SIZE "$part" 2>/dev/null | xargs)
-    mnt=$(mktemp -d "/tmp/usb-preview-XXXX")
-    echo "--- $part ($fstype, $size${label:+, label=$label}) ---"
-    if mount -o ro "$part" "$mnt" 2>/dev/null; then
-      ls -1 "$mnt" 2>/dev/null | head -20
-      umount "$mnt" 2>/dev/null || true
-    else
-      echo "  (could not mount)"
-    fi
-    rmdir "$mnt" 2>/dev/null || true
-  done
-  echo ""
+if [[ "$BUILD_ISO_ONLY" != "1" ]]; then
+  echo "WARNING: This will ERASE ALL DATA on $USB_DEV"
+  read -r -p "List contents before erasing? (y/N): " list_confirm
+  if [[ "$list_confirm" =~ ^[Yy]$ ]]; then
+    echo ""
+    for part in "${USB_DEV}"* "${USB_DEV}p"*; do
+      [[ -b "$part" && "$part" != "$USB_DEV" ]] || continue
+      label=$(lsblk -no LABEL "$part" 2>/dev/null | xargs)
+      fstype=$(lsblk -no FSTYPE "$part" 2>/dev/null | xargs)
+      size=$(lsblk -no SIZE "$part" 2>/dev/null | xargs)
+      mnt=$(mktemp -d "/tmp/usb-preview-XXXX")
+      echo "--- $part ($fstype, $size${label:+, label=$label}) ---"
+      if mount -o ro "$part" "$mnt" 2>/dev/null; then
+        ls -1 "$mnt" 2>/dev/null | head -20
+        umount "$mnt" 2>/dev/null || true
+      else
+        echo "  (could not mount)"
+      fi
+      rmdir "$mnt" 2>/dev/null || true
+    done
+    echo ""
+  fi
+  read -r -p "Erase and continue? (y/N): " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || die "Aborted."
 fi
-read -r -p "Erase and continue? (y/N): " confirm
-[[ "$confirm" =~ ^[Yy]$ ]] || die "Aborted."
 
 # --- Step 1: Extract the original ISO ---
 echo ""
@@ -221,9 +235,15 @@ if [[ -f "$GRUB_CFG" ]]; then
   write_grub_cfg "$GRUB_CFG" "Install Kubernetes Node"
 fi
 
-# --- Step 3: Repack the ISO ---
+# --- Step 3: Pre-download offline packages ---
 echo ""
-echo "=== [3/5] Repacking ISO with xorriso ==="
+echo "=== [3/6] Pre-downloading offline packages ==="
+IFS=' ' read -ra _offline_pkgs <<< "${OFFLINE_PACKAGES:-}"
+download_offline_packages "$WORK_DIR/extract/drivers" "${_offline_pkgs[@]}"
+
+# --- Step 4: Repack the ISO ---
+echo ""
+echo "=== [4/6] Repacking ISO with xorriso ==="
 ISO_OUT="$WORK_DIR/ubuntu-autoinstall.iso"
 xorriso -as mkisofs \
   -r -V 'Ubuntu-Server 24.04.4 LTS amd64' \
@@ -242,15 +262,29 @@ xorriso -as mkisofs \
   -o "$ISO_OUT" "$WORK_DIR/extract/" 2>&1 | tail -3
 echo "  ISO created: $ISO_OUT"
 
+if [[ "$BUILD_ISO_ONLY" == "1" ]]; then
+  echo ""
+  echo "=== BUILD_ISO_ONLY=1 — skipping USB write + CIDATA — done. ==="
+  exit 0
+fi
+
 # --- Step 4: Write ISO to USB with dd ---
 echo ""
-echo "=== [4/5] Writing ISO to USB ==="
+echo "=== [5/6] Writing ISO to USB ==="
 umount "${USB_DEV}"* 2>/dev/null || true
 dd if="$ISO_OUT" of="$USB_DEV" bs=4M status=progress conv=fsync 2>&1
 
-# --- Step 5: Create CIDATA partition ---
+# Force kernel to drop the old partition table before modifying it
+sync
+udevadm settle 2>/dev/null || true
+partprobe "$USB_DEV" 2>/dev/null || true
+blockdev --rereadpt "$USB_DEV" 2>/dev/null || true
+udevadm settle 2>/dev/null || true
+sleep 2
+
+# --- Step 6: Create CIDATA partition ---
 echo ""
-echo "=== [5/5] Creating CIDATA partition ==="
+echo "=== [6/6] Creating CIDATA partition ==="
 sgdisk -e "$USB_DEV"
 
 # Find where the existing partitions end
@@ -258,13 +292,19 @@ LAST_SECTOR=$(sgdisk -p "$USB_DEV" | awk '/^ *[0-9]/{end=$3} END{print end}')
 CIDATA_START=$((LAST_SECTOR + 1))
 
 sgdisk -n 4:"$CIDATA_START":+100M -t 4:0700 -c 4:CIDATA "$USB_DEV"
-partprobe "$USB_DEV"
-sleep 2
+sync
+# Poll for the new partition node — the kernel may take a moment
+for _i in $(seq 1 15); do
+  partprobe "$USB_DEV" 2>/dev/null || true
+  udevadm settle 2>/dev/null || true
+  [[ -b "${USB_DEV}4" || -b "${USB_DEV}p4" ]] && break
+  sleep 1
+done
 
 # Determine partition device name
 CIDATA_PART="${USB_DEV}4"
 [[ -b "$CIDATA_PART" ]] || CIDATA_PART="${USB_DEV}p4"
-[[ -b "$CIDATA_PART" ]] || die "Cannot find CIDATA partition"
+[[ -b "$CIDATA_PART" ]] || die "Cannot find CIDATA partition — try unplugging and replugging the USB drive, then re-run"
 
 mkfs.vfat -F 16 -n CIDATA "$CIDATA_PART"
 

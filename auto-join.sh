@@ -35,10 +35,13 @@ if ! ping -c1 -W2 "$MASTER_IP" >/dev/null 2>&1; then
   exit 1
 fi
 
-# Get join command from master (SSH key is restricted to only this command)
-echo "[$(date)] auto-join: requesting join command from master..."
+# Get join command from master.  The SSH forced-command on the master is
+# the k8s-print-join-command.sh wrapper; it reads our hostname from
+# $SSH_ORIGINAL_COMMAND and deletes any stale Node object before printing
+# a fresh join command.  This makes reimaging a node hands-off.
+echo "[$(date)] auto-join: requesting join command from master (hostname=$(hostname))..."
 JOIN_CMD=$(ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
-  "${MASTER_USER}@${MASTER_IP}" 2>/dev/null)
+  "${MASTER_USER}@${MASTER_IP}" "$(hostname)" 2>/dev/null)
 
 if [[ -z "$JOIN_CMD" || ! "$JOIN_CMD" =~ "kubeadm join" ]]; then
   echo "[$(date)] auto-join: ERROR — did not receive a valid join command"
