@@ -129,6 +129,11 @@ done
 [[ "$phase" == "Succeeded" ]] || { echo "Timed out waiting for ISO import (phase=$phase)" >&2; exit 1; }
 
 echo "=== Waiting for VM to start ==="
+# runStrategy=RerunOnFailure does NOT auto-start a Stopped VM on apply (it
+# only relaunches a failed VMI).  Explicitly start it now that the ISO PVC
+# is fully imported — starting earlier makes the virt-launcher pod claim the
+# PVC before CDI's importer can write to it (ImportTargetInUse).
+virtctl start -n "$NS" k8thumbsup-worker >/dev/null 2>&1 || true
 kubectl -n "$NS" wait --for=condition=Ready vmi/k8thumbsup-worker --timeout=180s || true
 kubectl -n "$NS" get vmi k8thumbsup-worker -o wide
 

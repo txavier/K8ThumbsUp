@@ -20,9 +20,9 @@ if [[ -f "$STAMP" ]]; then
   exit 0
 fi
 
-# Wait for network
+# Wait for network (up to 10 min — WiFi DKMS firstboot may be slow)
 echo "[$(date)] auto-join: waiting for network..."
-for i in $(seq 1 30); do
+for i in $(seq 1 120); do
   if ping -c1 -W2 "$MASTER_IP" >/dev/null 2>&1; then
     echo "[$(date)] auto-join: master reachable"
     break
@@ -32,6 +32,38 @@ done
 
 if ! ping -c1 -W2 "$MASTER_IP" >/dev/null 2>&1; then
   echo "[$(date)] auto-join: ERROR — cannot reach master at $MASTER_IP"
+  exit 1
+fi
+
+# Bootstrap k8s packages if the installer deferred install (no DNS at install time)
+if ! command -v kubeadm >/dev/null 2>&1 || ! command -v containerd >/dev/null 2>&1; then
+  echo "[$(date)] auto-join: kubeadm/containerd missing, installing now..."
+  mkdir -p /etc/apt/keyrings
+  if [[ ! -s /etc/apt/keyrings/kubernetes-apt-keyring.gpg ]]; then
+    curl -fsSL --max-time 30 https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key \
+      | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  fi
+  if [[ ! -f /etc/apt/sources.list.d/kubernetes.list ]]; then
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /" \
+      > /etc/apt/sources.list.d/kubernetes.list
+  fi
+  mkdir -p /etc/apt/preferences.d
+  printf 'Package: containerd\nPin: version 1.7.28*\nPin-Priority: 1001\n' \
+    > /etc/apt/preferences.d/containerd-pin
+  apt-get update -qq
+  apt-get install -y -qq containerd kubelet kubeadm kubectl
+  apt-mark hold kubelet kubeadm kubectl
+  mkdir -p /etc/containerd
+  containerd config default > /etc/containerd/config.toml
+  sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  systemctl enable --now containerd
+  systemctl enable kubelet
+  echo "[$(date)] auto-join: k8s packages installed"
+fi
+
+# Verify kubeadm is actually installed (autoinstall sometimes fails to install it)
+if ! command -v kubeadm >/dev/null 2>&1; then
+  echo "[$(date)] auto-join: ERROR — kubeadm not installed; cannot join cluster"
   exit 1
 fi
 

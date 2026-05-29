@@ -33,7 +33,7 @@ if [[ -f "$SCRIPT_DIR/config.env" ]]; then
 fi
 
 UBUNTU_ISO="${UBUNTU_ISO:-}"
-WORK_DIR="/tmp/iso-repack-head"
+WORK_DIR="${WORK_DIR:-/tmp/iso-repack-head}"
 CIDATA_MOUNT="/mnt/cidata"
 
 cleanup() {
@@ -150,6 +150,15 @@ echo ""
 echo "=== [1/5] Extracting Ubuntu ISO ==="
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR/extract"
+
+# Sanity check: need ~2x the ISO size in WORK_DIR (extracted tree + repacked ISO)
+ISO_SIZE_MB=$(du -m "$UBUNTU_ISO" | awk '{print $1}')
+NEED_MB=$(( ISO_SIZE_MB * 2 + 1024 ))   # 2x ISO + ~1G headroom for offline pkgs
+AVAIL_MB=$(df -Pm "$WORK_DIR" | awk 'NR==2 {print $4}')
+if (( AVAIL_MB < NEED_MB )); then
+  die "Not enough free space in $WORK_DIR: have ${AVAIL_MB}MB, need ~${NEED_MB}MB.
+  Set WORK_DIR=/path/with/space (e.g. WORK_DIR=/var/tmp/iso-repack-head or a mounted disk) and re-run."
+fi
 xorriso -osirrox on -indev "$UBUNTU_ISO" -extract / "$WORK_DIR/extract" 2>/dev/null
 chmod -R u+w "$WORK_DIR/extract"
 
@@ -218,6 +227,12 @@ echo ""
 echo "=== [3/6] Pre-downloading offline packages ==="
 IFS=' ' read -ra _offline_pkgs <<< "${OFFLINE_PACKAGES:-}"
 download_offline_packages "$WORK_DIR/extract/drivers" "${_offline_pkgs[@]}"
+
+# Same out-of-tree RTL8852CU DKMS build as prepare-usb.sh — see comment
+# there for details.  Best-effort.
+build_rtl8852cu_deb "$WORK_DIR/extract/drivers" || \
+  echo "WARN: rtl8852cu .deb not produced; 8852cu USB WiFi will not work on target"
+regenerate_offline_apt_index "$WORK_DIR/extract/drivers"
 
 # --- Step 4: Repack the ISO ---
 echo ""

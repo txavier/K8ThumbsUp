@@ -11,13 +11,31 @@ autoinstall:
   keyboard:
     layout: us
 
+  # NOTE: do NOT register file:///cdrom/drivers/ via `apt.sources` here.
+  # subiquity's curtin apt-config phase runs `apt-get update` inside a
+  # transient chroot that bind-mounts only /dev /proc /run /sys — /cdrom
+  # is NOT visible, so apt errors with "File not found - /cdrom/drivers/
+  # ./Packages" and the whole install aborts (exit 100) on any node where
+  # the online mirror is also unreachable (e.g. machines with only WiFi
+  # NICs and no working driver yet — exactly the case we ship offline
+  # drivers for).
+  #
+  # Instead, the offline `drivers/` tree is consumed in late-commands
+  # below, where /cdrom IS reachable and we can copy it into /target
+  # before running apt-get install.
+  apt:
+    conf: |
+      APT::Get::AllowUnauthenticated "true";
+      Acquire::AllowInsecureRepositories "true";
+      Acquire::AllowDowngradeToInsecureRepositories "true";
+
   # WiFi via early-commands: install wpasupplicant, then netplan apply
   # Also runs crypto-scan if booted with the "SCAN FOR CRYPTO" GRUB option
   early-commands:
     - |
       IFACE=$(ls /sys/class/net/ | grep -E '^wl' | head -1)
       if [ -n "$IFACE" ]; then
-        apt-get install --quiet --assume-yes wpasupplicant 2>/dev/null || true
+        apt-get install --quiet --assume-yes --allow-unauthenticated wpasupplicant 2>/dev/null || true
         systemctl start wpa_supplicant.service 2>/dev/null || true
         rfkill unblock wifi 2>/dev/null || true
         ip link set "$IFACE" up
@@ -41,6 +59,37 @@ autoinstall:
           while true; do sleep 3600; done
         fi
       fi
+    # Tear down any pre-existing LVM and wipe signatures on the largest
+    # fixed (non-removable) disk.  Without this, reinstalling onto a disk
+    # that already holds an Ubuntu LVM layout makes curtin's `vgcreate
+    # ubuntu-vg` fail with "/dev/ubuntu-vg: already exists in filesystem"
+    # because the kernel auto-activates the old VG at boot and curtin's
+    # `wipe: superblock-recursive` runs too late to prevent the collision.
+    - |
+      set +e
+      command -v vgs >/dev/null 2>&1 || apt-get install --quiet --assume-yes --allow-unauthenticated lvm2 2>/dev/null
+      for vg in $(vgs --noheadings -o vg_name 2>/dev/null | awk '{print $1}'); do
+        vgchange -an "$vg" 2>/dev/null
+        vgremove -ff -y "$vg" 2>/dev/null
+      done
+      for pv in $(pvs --noheadings -o pv_name 2>/dev/null | awk '{print $1}'); do
+        pvremove -ff -y "$pv" 2>/dev/null
+      done
+      # Identify the largest fixed disk (matches subiquity's `match: {size: largest}`)
+      TARGET=$(lsblk -dn -b -o NAME,SIZE,TYPE,RM 2>/dev/null \
+        | awk '$3=="disk" && $4==0 {print $2, $1}' \
+        | sort -rn | head -1 | awk '{print "/dev/"$2}')
+      if [ -n "$TARGET" ] && [ -b "$TARGET" ]; then
+        echo "[autoinstall] Wiping pre-existing signatures on $TARGET"
+        for part in $(lsblk -ln -o NAME "$TARGET" 2>/dev/null | tail -n +2); do
+          wipefs -a "/dev/$part" 2>/dev/null
+        done
+        wipefs -a "$TARGET" 2>/dev/null
+        sgdisk --zap-all "$TARGET" 2>/dev/null || dd if=/dev/zero of="$TARGET" bs=1M count=10 2>/dev/null
+        partprobe "$TARGET" 2>/dev/null
+        udevadm settle
+      fi
+      true
 
   # Wipe the first disk — root LV size set by __ROOT_LV_SIZE__ (config.env)
   # Use -1 to fill VG, or e.g. 45G to reserve remaining space for Rook/Ceph OSD
@@ -77,20 +126,24 @@ autoinstall:
     install-server: true
     allow-pw: true
 
-  # Minimal package set — node-setup.sh handles the rest
+  # Minimal package set — node-setup.sh handles the rest.
+  #
+  # Only packages available from the ISO's built-in `cdrom:` source
+  # (noble main/restricted) belong here.  Anything that lives in
+  # `universe` — the HWE kernel, dkms toolchain, WiFi userland, WiFi
+  # driver DKMS modules — is installed in late-commands from the
+  # offline /cdrom/drivers/ repo.  We cannot list those here because
+  # curtin's postinstall phase runs `apt-get install` inside
+  # `chroot /target`, which has no /cdrom mount and no offline apt
+  # source yet (the offline source is only added in late-commands),
+  # so any universe package in this list fails with exit 100 and
+  # aborts the install before late-commands ever run.
   packages:
     - curl
     - ca-certificates
     - gpg
     - apt-transport-https
     - linux-firmware
-    - wpasupplicant
-    - iw
-    - wireless-tools
-    - linux-image-6.8.0-107-generic
-    - linux-headers-6.8.0-107-generic
-    - linux-modules-extra-6.8.0-107-generic
-    - dkms
 
   # Disable swap partition (Ubuntu Server sometimes creates one)
   swap:
@@ -104,27 +157,192 @@ autoinstall:
   # even if apt-get fails due to DNS issues during install.
   #
   late-commands:
+    # ---- Offline drivers repo: stage into /target and install WiFi stack ----
+    #
+    # We copy /cdrom/drivers into the installed system so it remains usable
+    # after first boot, and so apt sees a path that exists in the target.
+    # All subsequent commands run with the target as their root (curtin
+    # in-target), so `file:///var/cache/k8thumbsup-drivers/` resolves
+    # correctly even with no network.
+    #
+    # `|| true` on the install lines keeps the install from aborting if a
+    # specific driver .deb is missing for the running arch — the box may
+    # still have a working wired NIC and can pull the rest later.
+    - mkdir -p /target/var/cache/k8thumbsup-drivers
+    - cp -a /cdrom/drivers/. /target/var/cache/k8thumbsup-drivers/
+    - |
+      cat > /target/etc/apt/sources.list.d/k8thumbsup-offline.list <<EOF
+      deb [trusted=yes] file:///var/cache/k8thumbsup-drivers/ ./
+      EOF
+    - curtin in-target --target=/target -- apt-get update -o Acquire::AllowInsecureRepositories=true || true
+    # Kernel headers (matching the kernel subiquity already installed from
+    # cdrom:) + modules-extra + dkms toolchain.  These MUST install
+    # successfully — they're required for DKMS WiFi modules to compile
+    # against the running kernel.  No `|| true` here.
+    #
+    # NOTE: We do NOT install linux-image-* here — the kernel is already
+    # installed by subiquity's base postinstall (linux-generic metapackage
+    # from cdrom:).  We also do NOT install `linux-headers-generic` (the
+    # metapackage) because in the offline repo its candidate version may
+    # not match what the squashfs shipped, which causes apt to try to pull
+    # in a different kernel ABI than what's on disk and fail.
+    #
+    # The exact versioned package names are substituted by prepare-usb.sh
+    # based on the ISO's casper/filesystem.manifest.  Tee output to
+    # /var/log/k8thumbsup-offline-install.log so post-mortems are possible
+    # without journald (which doesn't persist across install failure).
+    - 'curtin in-target --target=/target -- sh -c ''apt-get install -y --allow-unauthenticated --no-install-recommends __KERNEL_HEADERS_PKG__ __KERNEL_MODULES_EXTRA_PKG__ dkms build-essential 2>&1 | tee /var/log/k8thumbsup-offline-install.log'''
+    # Core WiFi userland (needed at first boot for wpa_supplicant + netplan)
+    - curtin in-target --target=/target -- apt-get install -y --allow-unauthenticated wpasupplicant iw wireless-tools || true
+    # In-tree-missing WiFi driver DKMS modules.
+    #
+    # IMPORTANT: each DKMS package is installed in its OWN command, wrapped
+    # in `timeout` with a hard cap, and with DEBIAN_FRONTEND=noninteractive
+    # forced.  Reasons:
+    #   * broadcom-sta-dkms's postinst has been observed to hang
+    #     indefinitely during the DKMS module build against the target
+    #     kernel headers (subiquity then sits forever on this late-command
+    #     because `|| true` does NOT cover a hang, only a non-zero exit).
+    #   * Bundling iwlwifi + broadcom in a single apt-get means a hang in
+    #     either one prevents the other from being installed.
+    #   * curtin sets DEBIAN_FRONTEND=noninteractive itself, but we set it
+    #     again explicitly so any sub-shell DKMS triggers inherit it and
+    #     cannot prompt on stdin (which would also look like a hang).
+    # Output is appended to /var/log/k8thumbsup-offline-install.log so the
+    # post-mortem is available on the installed system even if the install
+    # itself fails before journald is persisted.
+    - 'curtin in-target --target=/target -- sh -c ''DEBIAN_FRONTEND=noninteractive timeout 600 apt-get install -y --allow-unauthenticated backport-iwlwifi-dkms 2>&1 | tee -a /var/log/k8thumbsup-offline-install.log; true'''
+    - 'curtin in-target --target=/target -- sh -c ''DEBIAN_FRONTEND=noninteractive timeout 600 apt-get install -y --allow-unauthenticated broadcom-sta-dkms 2>&1 | tee -a /var/log/k8thumbsup-offline-install.log; true'''
+
     # Install Realtek USB WiFi drivers (RTL8812AU/8821AU/8814AU) from multiverse
-    # These are common USB adapters not supported by the mainline kernel
-    - curtin in-target --target=/target -- add-apt-repository multiverse -y
-    - curtin in-target --target=/target -- apt-get install -y realtek-rtl88xxau-dkms
+    # These are common USB adapters not supported by the mainline kernel.
+    # The .deb + deps were pre-staged into /cdrom/drivers/ by prepare-usb.sh
+    # so this install path works fully offline.  Same hang-proof wrapper
+    # as the other DKMS installs above (timeout + noninteractive + log).
+    - 'curtin in-target --target=/target -- sh -c ''DEBIAN_FRONTEND=noninteractive timeout 600 apt-get install -y --allow-unauthenticated realtek-rtl88xxau-dkms 2>&1 | tee -a /var/log/k8thumbsup-offline-install.log; true'''
+
+    # Realtek RTL8852CU USB WiFi 6 (802.11ax) DKMS driver.  Built from
+    # github.com/morrownr/rtl8852cu-20251113 by prepare-usb.sh on the build host
+    # (no apt package exists for this chip's USB variant).  Same
+    # hang-proof wrapper as the other DKMS installs above.  Required for
+    # any USB WiFi adapter advertising "802.11ax WLAN Adapter" /
+    # Realtek 8852 (e.g. idVendor 0db0 idProduct 991d).
+    - 'curtin in-target --target=/target -- sh -c ''DEBIAN_FRONTEND=noninteractive timeout 600 apt-get install -y --allow-unauthenticated rtl8852cu-dkms 2>&1 | tee -a /var/log/k8thumbsup-offline-install.log; true'''
 
     # Persist WiFi config in the installed system (detect actual wireless interface name)
+    # Always write the WiFi netplan with a glob match on wl*.
+    #
+    # WiFi netplan must be written at FIRST BOOT, not here, because:
+    #   1. The live installer kernel does not load our freshly-built DKMS
+    #      module, so no wl* interface exists at install time.
+    #   2. netplan's networkd backend rejects `match:` for wifi stanzas
+    #      ("networkd backend does not support wifi with match:, only by
+    #      interface name") — so we cannot use a glob to bind whatever
+    #      udev names the adapter at boot.
+    # Solution: drop a oneshot service + script that, on first boot, waits
+    # for a wl* interface to appear, writes /etc/netplan/90-wifi.yaml using
+    # that exact interface name, and runs `netplan apply`.  It runs before
+    # systemd-networkd-wait-online so DHCP can complete in the normal flow.
     - |
-      WIFI_IFACE=$(ls /sys/class/net/ | grep -E '^wl' | head -1)
-      if [ -n "$WIFI_IFACE" ]; then
-        cat > /target/etc/netplan/90-wifi.yaml <<WIFIEOF
+      install -d -m 0755 /target/usr/local/sbin
+      cat > /target/usr/local/sbin/k8s-wifi-firstboot.sh <<'WIFISH'
+      #!/bin/sh
+      # Wait for a wl* interface (USB adapter may take a few seconds to enumerate
+      # and the DKMS module to load), then write a netplan config bound to its
+      # actual name (networkd backend forbids `match:` for wifis).
+      set -eu
+      MARKER=/var/lib/k8s-wifi-firstboot.done
+      [ -e "$MARKER" ] && exit 0
+      IFACE=""
+      for i in $(seq 1 60); do
+        IFACE=$(ls /sys/class/net/ 2>/dev/null | grep -E '^wl' | head -1 || true)
+        [ -n "$IFACE" ] && break
+        sleep 1
+      done
+      if [ -z "$IFACE" ]; then
+        echo "k8s-wifi-firstboot: no wl* interface after 60s, giving up" >&2
+        exit 0
+      fi
+      rfkill unblock wifi 2>/dev/null || true
+      umask 077
+      cat > /etc/netplan/90-wifi.yaml <<NPEOF
       network:
         version: 2
         wifis:
-          ${WIFI_IFACE}:
+          $IFACE:
             dhcp4: true
+            optional: true
             access-points:
               "__WIFI_SSID__":
                 password: "__WIFI_PASSWORD__"
-      WIFIEOF
-        chmod 600 /target/etc/netplan/90-wifi.yaml
-      fi
+      NPEOF
+      chmod 600 /etc/netplan/90-wifi.yaml
+      netplan generate
+      netplan apply
+      mkdir -p "$(dirname "$MARKER")"
+      : > "$MARKER"
+      WIFISH
+      chmod 755 /target/usr/local/sbin/k8s-wifi-firstboot.sh
+      cat > /target/etc/systemd/system/k8s-wifi-firstboot.service <<'WIFISVC'
+      [Unit]
+      Description=Configure WiFi netplan on first boot (USB adapter, late-appearing)
+      DefaultDependencies=no
+      After=systemd-udev-settle.service network-pre.target
+      Before=systemd-networkd-wait-online.service network-online.target NetworkManager.service
+      Wants=systemd-udev-settle.service
+      ConditionPathExists=!/var/lib/k8s-wifi-firstboot.done
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/k8s-wifi-firstboot.sh
+
+      [Install]
+      WantedBy=multi-user.target
+      WIFISVC
+      install -d -m 0755 /target/etc/systemd/system/multi-user.target.wants
+      ln -sf /etc/systemd/system/k8s-wifi-firstboot.service \
+        /target/etc/systemd/system/multi-user.target.wants/k8s-wifi-firstboot.service
+
+    # Always write a fallback ethernet netplan that DHCPs on any wired NIC.
+    # Without this, wired-only boxes (e.g. Optiplex 3090 with no WiFi card)
+    # come up with no network at all: subiquity only writes a netplan entry
+    # for interfaces that were actually used during install, so if WiFi was
+    # the install path the wired NIC is omitted; and we disable cloud-init
+    # below, so it cannot recover at first boot.  Globbing en* covers both
+    # predictable names (enp*, eno*, ens*) and legacy eth* via a second match.
+    - |
+      cat > /target/etc/netplan/80-ethernet-fallback.yaml <<ETHEOF
+      network:
+        version: 2
+        ethernets:
+          all-en:
+            match:
+              name: "en*"
+            dhcp4: true
+            optional: true
+          all-eth:
+            match:
+              name: "eth*"
+            dhcp4: true
+            optional: true
+      ETHEOF
+      chmod 600 /target/etc/netplan/80-ethernet-fallback.yaml
+
+    # Validate netplan config in-target so any YAML / schema / backend error
+    # (e.g. networkd rejecting `match:` on wifis) fails the install instead
+    # of silently breaking first-boot networking.  We tee the output to the
+    # offline-install log so it shows up in collect-debug output too.
+    - |
+      curtin in-target --target=/target -- sh -c '
+        set -e
+        echo "=== netplan generate validation ($(date -Iseconds)) ===" \
+          | tee -a /var/log/k8thumbsup-offline-install.log
+        ls -la /etc/netplan/ \
+          | tee -a /var/log/k8thumbsup-offline-install.log
+        netplan generate 2>&1 \
+          | tee -a /var/log/k8thumbsup-offline-install.log
+      '
 
     # Set hostname: uses NODE_HOSTNAME from top of file if set, otherwise auto-generates from MAC
     - |
@@ -194,8 +412,8 @@ autoinstall:
         echo "[$(date)] auto-join: already joined, skipping"
         exit 0
       fi
-      echo "[$(date)] auto-join: waiting for network..."
-      for i in $(seq 1 30); do
+      echo "[$(date)] auto-join: waiting for network (up to 10 min)..."
+      for i in $(seq 1 120); do
         if ping -c1 -W2 "$MASTER_IP" >/dev/null 2>&1; then
           echo "[$(date)] auto-join: master reachable"
           break
@@ -204,6 +422,36 @@ autoinstall:
       done
       if ! ping -c1 -W2 "$MASTER_IP" >/dev/null 2>&1; then
         echo "[$(date)] auto-join: ERROR — cannot reach master at $MASTER_IP"
+        exit 1
+      fi
+      # Bootstrap k8s packages if late-commands deferred install (no DNS at install time)
+      if ! command -v kubeadm >/dev/null 2>&1 || ! command -v containerd >/dev/null 2>&1; then
+        echo "[$(date)] auto-join: kubeadm/containerd missing, installing now..."
+        mkdir -p /etc/apt/keyrings
+        if [ ! -s /etc/apt/keyrings/kubernetes-apt-keyring.gpg ]; then
+          curl -fsSL --max-time 30 https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key \
+            | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        fi
+        if [ ! -f /etc/apt/sources.list.d/kubernetes.list ]; then
+          echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /" \
+            > /etc/apt/sources.list.d/kubernetes.list
+        fi
+        mkdir -p /etc/apt/preferences.d
+        printf 'Package: containerd\nPin: version 1.7.28*\nPin-Priority: 1001\n' \
+          > /etc/apt/preferences.d/containerd-pin
+        apt-get update -qq
+        apt-get install -y -qq containerd kubelet kubeadm kubectl
+        apt-mark hold kubelet kubeadm kubectl
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+        systemctl enable --now containerd
+        systemctl enable kubelet
+        echo "[$(date)] auto-join: k8s packages installed"
+      fi
+      # Verify kubeadm is installed before continuing (autoinstall sometimes fails to install it)
+      if ! command -v kubeadm >/dev/null 2>&1; then
+        echo "[$(date)] auto-join: ERROR — kubeadm not installed; cannot join cluster"
         exit 1
       fi
       echo "[$(date)] auto-join: requesting join command from master..."
@@ -233,6 +481,10 @@ autoinstall:
       Type=oneshot
       ExecStart=/usr/local/bin/k8s-auto-join.sh
       RemainAfterExit=true
+      # Retry until kubeadm is installed + master reachable. ConditionPathExists
+      # on the unit means once /etc/kubernetes/.joined exists, retries stop.
+      Restart=on-failure
+      RestartSec=30s
 
       [Install]
       WantedBy=multi-user.target
@@ -360,16 +612,61 @@ autoinstall:
       mount --bind /proc /target/proc
       mount --bind /run /target/run
       mount --bind /sys /target/sys
+      # subiquity's chroot has no /etc/resolv.conf. Bind-mounting /run is not
+      # enough because /target/etc/resolv.conf is a dangling symlink to
+      # /run/systemd/resolve/stub-resolv.conf (which points at 127.0.0.53,
+      # but no resolver listens in the chroot). Subiquity's installer also
+      # doesn't always populate /run/systemd/resolve/resolv.conf with real
+      # upstream nameservers (it can be empty), so don't try to copy it.
+      # Just write hardcoded public DNS — it's reliable, the upstream
+      # router doesn't matter for fetching pkgs.k8s.io / archive.ubuntu.com,
+      # and first boot will recreate the systemd-resolved symlink anyway.
+      # Symptom we're avoiding: `chroot /target apt-get update` fails with
+      # apt exit code 100 ("Unable to fetch some archives").
+      rm -f /target/etc/resolv.conf
+      cat > /target/etc/resolv.conf <<'RESOLVEOF'
+      # Temporary, written by k8thumbsup autoinstall.
+      # First boot replaces this with the systemd-resolved stub symlink.
+      nameserver 1.1.1.1
+      nameserver 8.8.8.8
+      nameserver 9.9.9.9
+      RESOLVEOF
+      sed -i 's/^      //' /target/etc/resolv.conf
 
-    # Install containerd + Kubernetes packages (single block so failures don't break the chain)
+    # Install containerd + Kubernetes packages.
+    #
+    # IMPORTANT lessons learned (do not regress!):
+    #   1. `chroot /target curl ... | gpg --dearmor` SILENTLY produces a 0-byte
+    #      keyring file inside the chroot because the chroot has no working
+    #      /etc/resolv.conf. We now run curl on the LIVE installer environment
+    #      (which has WiFi DNS from early-commands) and write the keyring
+    #      directly into /target. We then verify the file is non-empty.
+    #   2. The block runs with `set -e` so any failure ABORTS the install
+    #      instead of leaving a half-provisioned node that will never join.
+    #   3. Even if this step fails, the k8s-auto-join.service is now
+    #      Restart=on-failure with kubeadm-presence check, so a manual
+    #      `apt-get install kubeadm` after first boot will let it self-heal.
     - |
-      set +e
+      set -e
+      echo "=== Verifying chroot has working DNS ===" >&2
+      if ! chroot /target getent hosts archive.ubuntu.com >/dev/null 2>&1; then
+        # Live installer DNS / WiFi is unreliable on bare-metal late-commands.
+        # Don't fail the install — defer k8s package install to first boot.
+        # k8s-auto-join.service (Restart=on-failure) will install
+        # kubeadm/kubelet/kubectl/containerd before joining the cluster.
+        echo "WARNING: chroot DNS not working; deferring k8s package install to first boot" >&2
+        cat /target/etc/resolv.conf >&2 || true
+        echo "WARNING: k8s-auto-join.service will install k8s packages at first boot" >&2
+        exit 0
+      fi
       echo "=== Installing containerd ===" >&2
       for attempt in 1 2 3; do
         chroot /target apt-get update -qq 2>&1 && break
         echo "apt-get update attempt $attempt failed, retrying in 10s..." >&2
         sleep 10
       done
+      mkdir -p /target/etc/apt/preferences.d
+      printf 'Package: containerd\nPin: version 1.7.28*\nPin-Priority: 1001\n' > /target/etc/apt/preferences.d/containerd-pin
       chroot /target apt-get install -y -qq containerd 2>&1
       chroot /target mkdir -p /etc/containerd
       chroot /target bash -c "containerd config default > /etc/containerd/config.toml" 2>&1
@@ -377,11 +674,24 @@ autoinstall:
       chroot /target systemctl enable containerd 2>&1
 
       echo "=== Adding Kubernetes apt repo ===" >&2
-      chroot /target mkdir -p /etc/apt/keyrings
-      chroot /target bash -c "curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg" 2>&1
+      mkdir -p /target/etc/apt/keyrings
+      # Fetch keyring on the LIVE env (has DNS), NOT in chroot (no DNS)
+      KEY_TMP=$(mktemp)
+      for attempt in 1 2 3; do
+        if curl -fsSL --max-time 30 https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key -o "$KEY_TMP" && [ -s "$KEY_TMP" ]; then
+          break
+        fi
+        echo "k8s key download attempt $attempt failed, retrying in 10s..." >&2
+        sleep 10
+      done
+      [ -s "$KEY_TMP" ] || { echo "FATAL: could not download Kubernetes Release.key" >&2; exit 1; }
+      gpg --dearmor < "$KEY_TMP" > /target/etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      rm -f "$KEY_TMP"
+      [ -s /target/etc/apt/keyrings/kubernetes-apt-keyring.gpg ] || { echo "FATAL: k8s keyring is empty after dearmor" >&2; exit 1; }
       cat > /target/etc/apt/sources.list.d/kubernetes.list <<REPOEOF
       deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /
       REPOEOF
+      sed -i 's/^      //' /target/etc/apt/sources.list.d/kubernetes.list
 
       echo "=== Installing kubeadm, kubelet, kubectl ===" >&2
       for attempt in 1 2 3; do
@@ -393,14 +703,38 @@ autoinstall:
       chroot /target apt-mark hold kubelet kubeadm kubectl 2>&1
       chroot /target systemctl enable kubelet 2>&1
 
-      # Report result
-      if chroot /target which kubeadm >/dev/null 2>&1; then
-        echo "=== Kubernetes packages installed successfully ===" >&2
-      else
-        echo "=== WARNING: Kubernetes packages NOT installed (DNS/network issue during install) ===" >&2
-        echo "=== Run node-setup.sh manually after boot to complete setup ===" >&2
-      fi
-      true
+      # Verify all four binaries actually landed in /target. Abort the install
+      # if any are missing — a half-installed node will never join the cluster.
+      for bin in kubeadm kubelet kubectl containerd; do
+        if ! chroot /target which "$bin" >/dev/null 2>&1; then
+          echo "FATAL: $bin not installed in /target after apt-get install" >&2
+          exit 1
+        fi
+      done
+      echo "=== All k8s binaries present: kubeadm kubelet kubectl containerd ===" >&2
+
+      # Pin the kernel metapackages to the ISO-shipped ABI so future
+      # `apt-get install <anything>` cannot silently pull a newer
+      # linux-image / linux-headers / linux-modules-extra point release.
+      # Out-of-tree DKMS drivers (notably rtl8852cu USB-WiFi) have been
+      # observed to fail to build against newer point-release headers
+      # (e.g. 6.8.0-117) while building cleanly against the ISO ABI
+      # (e.g. 6.8.0-100), leaving the booted system without a WiFi
+      # driver.  Users who want a kernel upgrade can `apt-mark unhold`
+      # these explicitly and accept the risk.
+      chroot /target apt-mark hold linux-generic linux-image-generic linux-headers-generic linux-modules-extra-generic 2>&1 || true
+
+      echo "=== Kubernetes packages installed successfully ===" >&2
+
+    # NOTE: a previous revision of this file had a kernel-purge step here that
+    # hardcoded ABI "6.8.0-107" and purged every other linux-image-*-generic
+    # package.  After switching to ISO-ABI auto-detection in prepare-usb.sh,
+    # the installed kernel is whatever the ISO ships (e.g. 6.8.0-100), which
+    # made the grep -v unmatch, purge the ONLY installed kernel, and leave
+    # the system with no bootable kernel \u2014 producing a silent BIOS-POST
+    # reboot loop even though shim/grub/EFI entries were all valid.  The
+    # offline package set no longer installs a second kernel, so the purge
+    # is unnecessary; do NOT reintroduce it without using the detected ABI.
 
     # Clean up bind mounts
     - |
@@ -408,6 +742,88 @@ autoinstall:
       umount /target/run 2>/dev/null || true
       umount /target/proc 2>/dev/null || true
       umount /target/dev 2>/dev/null || true
+
+    # ---- DKMS final rebuild against ALL installed kernels ----
+    #
+    # Any DKMS module whose postinst only built for the live-installer
+    # kernel ABI may be missing from the kernel that actually boots.
+    # Observed symptom: USB WiFi (rtl8852cu) silently has no driver on
+    # first boot even though the .deb installed cleanly, because the
+    # custom postinst we ship in build_rtl8852cu_deb used `dkms install`
+    # (single ABI) instead of `dkms autoinstall` (all installed ABIs).
+    #
+    # We deliberately DO NOT `apt-get install linux-headers-generic` here:
+    # that metapackage resolves online to the newest point-release ABI
+    # (e.g. 6.8.0-117) and installs an additional kernel image on /target
+    # whose headers may differ from the live installer's.  Some
+    # out-of-tree drivers (rtl8852cu in particular) fail to build against
+    # newer point releases, leaving the booted system without a USB-WiFi
+    # driver.  Staying on the ISO-shipped ABI guarantees a working build.
+    #
+    # Run `dkms autoinstall` against every kernel currently present under
+    # /target/lib/modules so each module is rebuilt for whatever kernel
+    # the installed system will boot.  In normal operation this is just
+    # one ABI (the one subiquity installed from cdrom:), but we iterate
+    # defensively in case something pulled extras.
+    - |
+      set +e
+      LOG=/var/log/k8thumbsup-offline-install.log
+      echo "=== final dkms autoinstall ($(date -Iseconds)) ===" >> "$LOG"
+      mount --bind /dev  /target/dev
+      mount --bind /proc /target/proc
+      mount --bind /sys  /target/sys
+      mount --bind /run  /target/run
+      # Rebuild every DKMS module against every installed kernel.
+      for KVER in $(ls /target/lib/modules 2>/dev/null); do
+        echo "=== dkms autoinstall -k $KVER ===" | tee -a /target"$LOG"
+        chroot /target dkms autoinstall -k "$KVER" 2>&1 | tee -a /target"$LOG"
+      done
+      # Make sure modules.alias is fresh so udev autoloads on first boot.
+      for KVER in $(ls /target/lib/modules 2>/dev/null); do
+        chroot /target depmod -a "$KVER" 2>&1 | tee -a /target"$LOG"
+      done
+      umount /target/run  2>/dev/null
+      umount /target/sys  2>/dev/null
+      umount /target/proc 2>/dev/null
+      umount /target/dev  2>/dev/null
+      true
+
+    # ---- Install UEFI removable-media fallback (\EFI\BOOT\BOOTX64.EFI) ----
+    #
+    # Belt-and-braces: the UEFI spec mandates that firmwares MUST boot
+    # \EFI\BOOT\BOOTX64.EFI when no Boot#### entry succeeds.  Copying
+    # shim+grub there means the install stays bootable even if NVRAM is
+    # later wiped or corrupted (e.g. CMOS reset, motherboard swap, or
+    # firmware refusing OS-added entries).  Curtin's own grub-install
+    # handles the normal Boot#### entry; this is purely a fallback.
+    # Costs ~4 MB of EFI partition space.
+    #
+    # NOTE: a previous revision of this file also ran efibootmgr from
+    # inside chroot /target to clean "stale" NVRAM entries.  That code
+    # was solving a non-problem (the real reboot loop was caused by a
+    # hardcoded kernel-ABI purge elsewhere in late-commands) and has
+    # been removed.  If a stale-NVRAM problem ever resurfaces, see git
+    # history for the chroot+efibootmgr scaffolding.
+    - |
+      set +e
+      LOG=/var/log/installer/efi-fallback.log
+      mkdir -p /var/log/installer
+      exec >>"$LOG" 2>&1
+      echo "==== EFI fallback install at $(date -Iseconds) ===="
+      ESP_MNT=$(findmnt -no TARGET /target/boot/efi)
+      if [ -z "$ESP_MNT" ] || [ ! -f "$ESP_MNT/EFI/ubuntu/shimx64.efi" ]; then
+        echo "Skipping: ESP not mounted or shim not present"
+        exit 0
+      fi
+      mkdir -p "$ESP_MNT/EFI/BOOT"
+      cp -f "$ESP_MNT/EFI/ubuntu/shimx64.efi"   "$ESP_MNT/EFI/BOOT/BOOTX64.EFI"
+      [ -f "$ESP_MNT/EFI/ubuntu/grubx64.efi" ] && \
+        cp -f "$ESP_MNT/EFI/ubuntu/grubx64.efi" "$ESP_MNT/EFI/BOOT/grubx64.efi"
+      [ -f "$ESP_MNT/EFI/ubuntu/mmx64.efi" ] && \
+        cp -f "$ESP_MNT/EFI/ubuntu/mmx64.efi"   "$ESP_MNT/EFI/BOOT/mmx64.efi"
+      sync
+      ls -la "$ESP_MNT/EFI/BOOT/"
+      true
 
     # Copy install logs to USB drive for debugging
     - |

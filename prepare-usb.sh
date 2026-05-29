@@ -32,7 +32,7 @@ if [[ "$RESERVE_CEPH_STORAGE" != "true" ]]; then
 fi
 
 UBUNTU_ISO="${UBUNTU_ISO:-}"
-WORK_DIR="/tmp/iso-repack"
+WORK_DIR="${WORK_DIR:-/tmp/iso-repack}"
 CIDATA_MOUNT="/mnt/cidata"
 
 # --- Helpers ---
@@ -173,6 +173,15 @@ echo ""
 echo "=== [1/5] Extracting Ubuntu ISO ==="
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR/extract"
+
+# Sanity check: need ~2x the ISO size in WORK_DIR (extracted tree + repacked ISO)
+ISO_SIZE_MB=$(du -m "$UBUNTU_ISO" | awk '{print $1}')
+NEED_MB=$(( ISO_SIZE_MB * 2 + 1024 ))   # 2x ISO + ~1G headroom for offline pkgs
+AVAIL_MB=$(df -Pm "$WORK_DIR" | awk 'NR==2 {print $4}')
+if (( AVAIL_MB < NEED_MB )); then
+  die "Not enough free space in $WORK_DIR: have ${AVAIL_MB}MB, need ~${NEED_MB}MB.
+  Set WORK_DIR=/path/with/space (e.g. WORK_DIR=/var/tmp/iso-repack or a mounted disk) and re-run."
+fi
 xorriso -osirrox on -indev "$UBUNTU_ISO" -extract / "$WORK_DIR/extract" 2>/dev/null
 chmod -R u+w "$WORK_DIR/extract"
 
@@ -206,6 +215,21 @@ echo "=== [2/5] Injecting autoinstall config ==="
 # Create NoCloud datasource directory inside the ISO
 mkdir -p "$WORK_DIR/extract/nocloud"
 
+# Detect the kernel ABI that the live ISO's minimal squashfs preinstalls.
+# Subiquity will already have this kernel on disk after the base install
+# completes, so we MUST use the matching headers/modules-extra packages in
+# the offline cache.  Using `linux-headers-generic` (a metapackage) or a
+# different ABI causes apt to try to upgrade the kernel and fail because
+# the offline repo doesn't contain the upgrade target.
+ISO_KERNEL_ABI="$(awk '/^linux-image-[0-9]/ {sub(/^linux-image-/,"",$1); print $1; exit}' \
+  "$WORK_DIR/extract/casper/filesystem.manifest" 2>/dev/null || true)"
+if [[ -z "$ISO_KERNEL_ABI" ]]; then
+  die "Could not detect kernel ABI from casper/filesystem.manifest"
+fi
+echo "  Detected ISO kernel ABI: $ISO_KERNEL_ABI"
+KERNEL_HEADERS_PKG="linux-headers-${ISO_KERNEL_ABI}"
+KERNEL_MODULES_EXTRA_PKG="linux-modules-extra-${ISO_KERNEL_ABI}"
+
 # Build user-data with real credentials injected
 KEY_CONTENT=$(sed 's/^/      /' "$NODE_KEY")
 SAFE_HASH=$(escape_for_sed "$PASSWORD_HASH")
@@ -216,8 +240,10 @@ sed -e "s|      __NODE_JOIN_KEY_PLACEHOLDER__|${KEY_CONTENT//$'\n'/\\n}|" \
     -e "s|__MASTER_IP__|${MASTER_IP}|g" \
     -e "s|__MASTER_USER__|${MASTER_USER}|g" \
     -e "s|__ROOT_LV_SIZE__|${ROOT_LV_SIZE}|g" \
+    -e "s|__KERNEL_HEADERS_PKG__|${KERNEL_HEADERS_PKG}|g" \
+    -e "s|__KERNEL_MODULES_EXTRA_PKG__|${KERNEL_MODULES_EXTRA_PKG}|g" \
   "$SCRIPT_DIR/autoinstall/user-data" > "$WORK_DIR/extract/nocloud/user-data"
-echo "  user-data (with key + WiFi injected)"
+echo "  user-data (with key + WiFi + kernel ABI injected)"
 echo "  Root LV size: $ROOT_LV_SIZE (RESERVE_CEPH_STORAGE=$RESERVE_CEPH_STORAGE)"
 
 cp "$SCRIPT_DIR/autoinstall/meta-data" "$WORK_DIR/extract/nocloud/meta-data"
@@ -239,7 +265,21 @@ fi
 echo ""
 echo "=== [3/6] Pre-downloading offline packages ==="
 IFS=' ' read -ra _offline_pkgs <<< "${OFFLINE_PACKAGES:-}"
+# Auto-append kernel-ABI-matched packages so the offline cache always lines
+# up with whatever subiquity already installed from cdrom: during the base
+# install.  See the kernel-version-pinning comment in config.env.
+_offline_pkgs+=("$KERNEL_HEADERS_PKG" "$KERNEL_MODULES_EXTRA_PKG")
+echo "  Adding ISO-matched kernel pkgs: $KERNEL_HEADERS_PKG $KERNEL_MODULES_EXTRA_PKG"
 download_offline_packages "$WORK_DIR/extract/drivers" "${_offline_pkgs[@]}"
+
+# Build & bundle the out-of-tree RTL8852CU DKMS driver (WiFi 6 USB adapters,
+# e.g. idVendor 0db0 idProduct 991d).  No Ubuntu apt package exists; we
+# clone morrownr/rtl8852cu-20251113 and produce a kernel-agnostic DKMS .deb on the
+# build host, then regenerate the offline Packages index so apt on the
+# target can find it.  Best-effort: failures here do not abort the build.
+build_rtl8852cu_deb "$WORK_DIR/extract/drivers" || \
+  echo "WARN: rtl8852cu .deb not produced; 8852cu USB WiFi will not work on target"
+regenerate_offline_apt_index "$WORK_DIR/extract/drivers"
 
 # --- Step 4: Repack the ISO ---
 echo ""
@@ -312,6 +352,13 @@ mkdir -p "$CIDATA_MOUNT"
 mount "$CIDATA_PART" "$CIDATA_MOUNT"
 cp "$WORK_DIR/extract/nocloud/user-data" "$CIDATA_MOUNT/user-data"
 cp "$WORK_DIR/extract/nocloud/meta-data" "$CIDATA_MOUNT/meta-data"
+# Post-install diagnostic script — run on a networkless installed node
+# with `sudo bash /media/*/CIDATA/collect-debug.sh` to dump a bundle
+# back onto the USB under debug-logs/<host>/<stamp>/.
+if [[ -f "$SCRIPT_DIR/collect-debug.sh" ]]; then
+  cp "$SCRIPT_DIR/collect-debug.sh" "$CIDATA_MOUNT/collect-debug.sh"
+  chmod 755 "$CIDATA_MOUNT/collect-debug.sh"
+fi
 sync
 umount "$CIDATA_MOUNT"
 
@@ -329,4 +376,9 @@ echo "    kubectl get nodes"
 echo ""
 echo "  Boot logs are auto-saved to the CIDATA partition"
 echo "  if the USB is plugged in during boot."
+echo ""
+echo "  If a node has no network after install, plug the USB"
+echo "  back in and run, as root on the failed node:"
+echo "    sudo bash /media/*/CIDATA/collect-debug.sh"
+echo "  ...then inspect debug-logs/<host>/<stamp>/00-SUMMARY.txt"
 echo ""

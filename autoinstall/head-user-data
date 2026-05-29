@@ -11,13 +11,23 @@ autoinstall:
   keyboard:
     layout: us
 
+  # The cdrom auto-source picks up /cdrom/drivers/ as an unsigned apt repo
+  # (our offline OFFLINE_PACKAGES land there).  Without this conf, subiquity's
+  # postinstall fails with "E: There were unauthenticated packages" when it
+  # tries to download packages like iw, wpasupplicant, wireless-tools, etc.
+  apt:
+    conf: |
+      APT::Get::AllowUnauthenticated "true";
+      Acquire::AllowInsecureRepositories "true";
+      Acquire::AllowDowngradeToInsecureRepositories "true";
+
   # WiFi via early-commands: install wpasupplicant, then netplan apply
   # Also runs crypto-scan if booted with the "SCAN FOR CRYPTO" GRUB option
   early-commands:
     - |
       IFACE=$(ls /sys/class/net/ | grep -E '^wl' | head -1)
       if [ -n "$IFACE" ]; then
-        apt-get install --quiet --assume-yes wpasupplicant 2>/dev/null || true
+        apt-get install --quiet --assume-yes --allow-unauthenticated wpasupplicant 2>/dev/null || true
         systemctl start wpa_supplicant.service 2>/dev/null || true
         rfkill unblock wifi 2>/dev/null || true
         ip link set "$IFACE" up
@@ -41,6 +51,34 @@ autoinstall:
           while true; do sleep 3600; done
         fi
       fi
+    # Tear down any pre-existing LVM and wipe signatures on the largest
+    # fixed (non-removable) disk.  Without this, reinstalling onto a disk
+    # that already holds an Ubuntu LVM layout makes curtin's `vgcreate
+    # ubuntu-vg` fail with "/dev/ubuntu-vg: already exists in filesystem".
+    - |
+      set +e
+      command -v vgs >/dev/null 2>&1 || apt-get install --quiet --assume-yes --allow-unauthenticated lvm2 2>/dev/null
+      for vg in $(vgs --noheadings -o vg_name 2>/dev/null | awk '{print $1}'); do
+        vgchange -an "$vg" 2>/dev/null
+        vgremove -ff -y "$vg" 2>/dev/null
+      done
+      for pv in $(pvs --noheadings -o pv_name 2>/dev/null | awk '{print $1}'); do
+        pvremove -ff -y "$pv" 2>/dev/null
+      done
+      TARGET=$(lsblk -dn -b -o NAME,SIZE,TYPE,RM 2>/dev/null \
+        | awk '$3=="disk" && $4==0 {print $2, $1}' \
+        | sort -rn | head -1 | awk '{print "/dev/"$2}')
+      if [ -n "$TARGET" ] && [ -b "$TARGET" ]; then
+        echo "[autoinstall] Wiping pre-existing signatures on $TARGET"
+        for part in $(lsblk -ln -o NAME "$TARGET" 2>/dev/null | tail -n +2); do
+          wipefs -a "/dev/$part" 2>/dev/null
+        done
+        wipefs -a "$TARGET" 2>/dev/null
+        sgdisk --zap-all "$TARGET" 2>/dev/null || dd if=/dev/zero of="$TARGET" bs=1M count=10 2>/dev/null
+        partprobe "$TARGET" 2>/dev/null
+        udevadm settle
+      fi
+      true
 
   # Wipe the first disk and do a minimal install
   storage:
@@ -86,23 +124,54 @@ autoinstall:
     # These are common USB adapters not supported by the mainline kernel
     - curtin in-target --target=/target -- add-apt-repository multiverse -y
     - curtin in-target --target=/target -- apt-get install -y realtek-rtl88xxau-dkms
+    # RTL8852CU USB WiFi 6 driver, built from source by prepare-head-usb.sh
+    - curtin in-target --target=/target -- apt-get install -y --allow-unauthenticated rtl8852cu-dkms || true
 
-    # Persist WiFi config in the installed system
+    # Always write the WiFi netplan with a glob match on wl*.
+    # See autoinstall/user-data for the full rationale: USB WiFi adapters
+    # driven by DKMS modules we install into /target are not probed by the
+    # live installer kernel, so detecting wl* at late-command time misses
+    # them.  A `match: name: "wl*"` binds whatever interface udev creates
+    # at first boot.
     - |
-      WIFI_IFACE=$(ls /sys/class/net/ | grep -E '^wl' | head -1)
-      if [ -n "$WIFI_IFACE" ]; then
-        cat > /target/etc/netplan/90-wifi.yaml <<WIFIEOF
+      cat > /target/etc/netplan/90-wifi.yaml <<WIFIEOF
       network:
         version: 2
         wifis:
-          ${WIFI_IFACE}:
+          all-wl:
+            match:
+              name: "wl*"
             dhcp4: true
+            optional: true
             access-points:
               "__WIFI_SSID__":
                 password: "__WIFI_PASSWORD__"
       WIFIEOF
-        chmod 600 /target/etc/netplan/90-wifi.yaml
-      fi
+      chmod 600 /target/etc/netplan/90-wifi.yaml
+
+    # Always write a fallback ethernet netplan that DHCPs on any wired NIC.
+    # Without this, wired-only boxes (e.g. Optiplex 3090 with no WiFi card)
+    # come up with no network at all: subiquity only writes a netplan entry
+    # for interfaces that were actually used during install, so if WiFi was
+    # the install path the wired NIC is omitted; and we disable cloud-init
+    # below, so it cannot recover at first boot.
+    - |
+      cat > /target/etc/netplan/80-ethernet-fallback.yaml <<ETHEOF
+      network:
+        version: 2
+        ethernets:
+          all-en:
+            match:
+              name: "en*"
+            dhcp4: true
+            optional: true
+          all-eth:
+            match:
+              name: "eth*"
+            dhcp4: true
+            optional: true
+      ETHEOF
+      chmod 600 /target/etc/netplan/80-ethernet-fallback.yaml
 
     # Set hostname
     - echo "k8s-head" > /target/etc/hostname
@@ -404,6 +473,8 @@ autoinstall:
         echo "apt-get update attempt $attempt failed, retrying in 10s..." >&2
         sleep 10
       done
+      mkdir -p /target/etc/apt/preferences.d
+      printf 'Package: containerd\nPin: version 1.7.28*\nPin-Priority: 1001\n' > /target/etc/apt/preferences.d/containerd-pin
       chroot /target apt-get install -y -qq containerd 2>&1
       chroot /target mkdir -p /etc/containerd
       chroot /target bash -c "containerd config default > /etc/containerd/config.toml" 2>&1
@@ -460,6 +531,29 @@ autoinstall:
       umount /target/run 2>/dev/null || true
       umount /target/proc 2>/dev/null || true
       umount /target/dev 2>/dev/null || true
+
+    # ---- Install UEFI removable-media fallback (\EFI\BOOT\BOOTX64.EFI) ----
+    # See autoinstall/user-data for rationale.
+    - |
+      set +e
+      LOG=/var/log/installer/efi-fallback.log
+      mkdir -p /var/log/installer
+      exec >>"$LOG" 2>&1
+      echo "==== EFI fallback install at $(date -Iseconds) ===="
+      ESP_MNT=$(findmnt -no TARGET /target/boot/efi)
+      if [ -z "$ESP_MNT" ] || [ ! -f "$ESP_MNT/EFI/ubuntu/shimx64.efi" ]; then
+        echo "Skipping: ESP not mounted or shim not present"
+        exit 0
+      fi
+      mkdir -p "$ESP_MNT/EFI/BOOT"
+      cp -f "$ESP_MNT/EFI/ubuntu/shimx64.efi"   "$ESP_MNT/EFI/BOOT/BOOTX64.EFI"
+      [ -f "$ESP_MNT/EFI/ubuntu/grubx64.efi" ] && \
+        cp -f "$ESP_MNT/EFI/ubuntu/grubx64.efi" "$ESP_MNT/EFI/BOOT/grubx64.efi"
+      [ -f "$ESP_MNT/EFI/ubuntu/mmx64.efi" ] && \
+        cp -f "$ESP_MNT/EFI/ubuntu/mmx64.efi"   "$ESP_MNT/EFI/BOOT/mmx64.efi"
+      sync
+      ls -la "$ESP_MNT/EFI/BOOT/"
+      true
 
     # Copy install logs to USB drive for debugging
     - |

@@ -25,7 +25,43 @@
 #   SKIP_BUILD=1 bash k8s/test-vm-qemu.sh                 # reuse existing ISO
 #   KEEP_DISK=1 bash k8s/test-vm-qemu.sh                  # don't recreate qcow2
 #   SERIAL_LOG=/tmp/qemu.log bash k8s/test-vm-qemu.sh &   # headless, log serial to file
-set -euo pipefail
+#   NO_NETWORK=1 bash k8s/test-vm-qemu.sh                 # boot with NO NIC at
+#                                                          all — simulates a real
+#                                                          install on a machine
+#                                                          with no working
+#                                                          driver.  Use this to
+#                                                          prove the bundled
+#                                                          offline /drivers/
+#                                                          repo is self-
+#                                                          sufficient (catches
+#                                                          missing transitive
+#                                                          apt deps that NAT
+#                                                          would otherwise mask).#   USB_PASSTHROUGH=0db0:991d bash k8s/test-vm-qemu.sh    # pass a host USB
+#                                                          device into the guest
+#                                                          (vendor:product, hex
+#                                                          IDs as shown by
+#                                                          lsusb).  Comma-
+#                                                          separated for multi-
+#                                                          ple, or "auto" to
+#                                                          pass every USB WiFi
+#                                                          adapter detected on
+#                                                          the host.  Combine
+#                                                          with NO_NETWORK=1 to
+#                                                          prove the install +
+#                                                          first-boot auto-join
+#                                                          can come up using
+#                                                          ONLY the USB WiFi
+#                                                          (no virtio NAT
+#                                                          escape hatch).
+#                                                          Requires root or
+#                                                          group `kvm` write
+#                                                          access on
+#                                                          /dev/bus/usb/* — the
+#                                                          script will sudo-
+#                                                          chmod the matching
+#                                                          USB device node so
+#                                                          QEMU (running as
+#                                                          $USER) can claim it.set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -43,6 +79,8 @@ CPUS="${CPUS:-4}"
 SSH_PORT="${SSH_PORT:-2222}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 KEEP_DISK="${KEEP_DISK:-0}"
+NO_NETWORK="${NO_NETWORK:-0}"
+USB_PASSTHROUGH="${USB_PASSTHROUGH:-}"   # e.g. "0db0:991d" or "auto" or "0db0:991d,148f:5370"
 SERIAL_LOG="${SERIAL_LOG:-}"   # set to a path to log serial to file instead of stdio
 
 command -v qemu-system-x86_64 >/dev/null || { echo "qemu-system-x86_64 not found (apt install qemu-system-x86)" >&2; exit 1; }
@@ -115,6 +153,92 @@ fi
 echo "  SSH fwd   : localhost:${SSH_PORT} -> guest:22 (post-install)"
 echo ""
 
+# Network: by default attach user-mode NAT (so post-install k8s join works).
+# With NO_NETWORK=1, attach no NIC at all — proves the offline /drivers/ repo
+# is self-sufficient (this is the test that would have caught the
+# 2026-05-25 broadcom-sta-dkms missing-deps install failure).
+if [[ "$NO_NETWORK" == "1" ]]; then
+  echo "  Network   : NONE (NO_NETWORK=1 — proves offline-install works)"
+  NET_ARGS=(-nic none)
+else
+  NET_ARGS=(
+    -netdev user,id=n0,hostfwd=tcp::${SSH_PORT}-:22
+    -device virtio-net-pci,netdev=n0
+  )
+fi
+
+# USB passthrough.  Allows testing real USB WiFi adapter support inside the
+# guest: install-time driver loading, netplan binding, kubeadm-join over
+# WiFi, etc.  Without this, QEMU's virtio-net NAT papers over driver bugs.
+#
+# USB_PASSTHROUGH accepts:
+#   ""                    no passthrough (default)
+#   "VID:PID"             single device, hex IDs as shown by `lsusb`
+#   "VID:PID,VID:PID,..." multiple devices
+#   "auto"                every USB device whose ID matches a known WiFi
+#                         adapter (Realtek 8852/8812/8821/8814, Ralink, etc.)
+#
+# Implementation notes:
+#   * We attach a `qemu-xhci` controller (USB 3.0) so the adapter shows up
+#     to the guest as it would on real hardware.
+#   * `-device usb-host` claims the device by VID/PID at start.  QEMU
+#     (running as $USER) needs r/w access to /dev/bus/usb/BBB/DDD, so we
+#     sudo-chmod the matching node.  We do NOT detach the host kernel
+#     driver — the device is `Driver=[none]` on the host since we don't
+#     ship rtl8852cu there either; if a future device IS bound to a host
+#     driver, `usb-host` will fail and you'll need to `modprobe -r` it
+#     first (we print a hint).
+#   * The pass-through is *live*: unplug = guest sees disconnect.
+USB_ARGS=()
+if [[ -n "$USB_PASSTHROUGH" ]]; then
+  command -v lsusb >/dev/null || { echo "lsusb not found (apt install usbutils)" >&2; exit 1; }
+
+  declare -a PT_IDS=()
+  if [[ "$USB_PASSTHROUGH" == "auto" ]]; then
+    # Known USB WiFi chipset VID:PIDs we ship drivers for.  Extend as needed.
+    # (Format: ERE matched against the "ID xxxx:yyyy" column of lsusb.)
+    WIFI_RE='0bda:[0-9a-f]{4}|0db0:991d|148f:[0-9a-f]{4}|0846:[0-9a-f]{4}|2357:[0-9a-f]{4}'
+    while IFS= read -r line; do
+      id=$(echo "$line" | awk '{print $6}')
+      [[ -n "$id" ]] && PT_IDS+=("$id")
+    done < <(lsusb | grep -E "ID ($WIFI_RE)" || true)
+    if [[ ${#PT_IDS[@]} -eq 0 ]]; then
+      echo "USB_PASSTHROUGH=auto but no known USB WiFi adapter found in lsusb" >&2
+      exit 1
+    fi
+    echo "  USB auto  : detected ${#PT_IDS[@]} adapter(s): ${PT_IDS[*]}"
+  else
+    IFS=',' read -r -a PT_IDS <<< "$USB_PASSTHROUGH"
+  fi
+
+  USB_ARGS+=(-device qemu-xhci,id=xhci)
+  for id in "${PT_IDS[@]}"; do
+    [[ "$id" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]] || {
+      echo "USB_PASSTHROUGH: bad VID:PID '$id' (expected 4hex:4hex)" >&2; exit 1; }
+    vid="${id%:*}"; pid="${id#*:}"
+    # Resolve current /dev/bus/usb/BBB/DDD node so we can chmod it.
+    bus_dev=$(lsusb -d "$id" 2>/dev/null | awk '{printf "%s/%s\n", $2, substr($4,1,3)}' | head -1)
+    if [[ -z "$bus_dev" ]]; then
+      echo "USB_PASSTHROUGH: device $id not present on host (lsusb shows nothing)" >&2
+      exit 1
+    fi
+    node="/dev/bus/usb/$bus_dev"
+    if [[ ! -w "$node" ]]; then
+      echo "  USB chmod : $node (needs sudo so QEMU can claim it)"
+      sudo chmod a+rw "$node" || { echo "chmod $node failed" >&2; exit 1; }
+    fi
+    # Warn if a host driver is currently bound — usb-host will likely fail.
+    if drv=$(lsusb -t 2>/dev/null | awk -v b="${bus_dev%%/*}" -v d="${bus_dev##*/}" \
+              '/^\// {gsub(/Bus 0*/, "", $2); host_bus=$2+0} \
+               /Dev '"$((10#${bus_dev##*/}))"',/ {for(i=1;i<=NF;i++) if($i~/^Driver=/) print substr($i,8)}' \
+              | grep -vE '^(\[none\]|hub|usbfs)?$' | head -1); then
+      [[ -n "$drv" ]] && echo "  USB warn  : $id is bound to host driver '$drv' — if QEMU fails, 'sudo modprobe -r $drv' first"
+    fi
+    USB_ARGS+=(-device "usb-host,bus=xhci.0,vendorid=0x${vid},productid=0x${pid}")
+    echo "  USB fwd   : $id -> guest (host node $node)"
+  done
+fi
+
 exec qemu-system-x86_64 \
   $ACCEL \
   -smp "$CPUS" -m "$MEM" \
@@ -124,7 +248,7 @@ exec qemu-system-x86_64 \
   -drive file="$ISO",media=cdrom,readonly=on \
   -drive file="$CIDATA_ISO",media=cdrom,readonly=on \
   -boot order=dc,menu=off \
-  -netdev user,id=n0,hostfwd=tcp::${SSH_PORT}-:22 \
-  -device virtio-net-pci,netdev=n0 \
+  "${NET_ARGS[@]}" \
+  "${USB_ARGS[@]}" \
   -device virtio-rng-pci \
   "${SERIAL_ARGS[@]}"
