@@ -59,8 +59,36 @@ autoinstall:
           while true; do sleep 3600; done
         fi
       fi
+    # Hide any USB-attached block devices (other than the install medium
+    # itself) from subiquity, so external USB drives plugged into the
+    # target machine cannot be picked up by `match: {size: largest}` or
+    # accidentally wiped.  We detach via /sys/.../device/delete, which
+    # removes the block device from the kernel for the duration of the
+    # install.  The install USB stays attached because /cdrom is mounted
+    # from it.
+    - |
+      set +e
+      INSTALL_SRC=$(findmnt -n -o SOURCE /cdrom 2>/dev/null)
+      INSTALL_DEV=""
+      if [ -n "$INSTALL_SRC" ]; then
+        INSTALL_DEV=$(lsblk -no PKNAME "$INSTALL_SRC" 2>/dev/null | head -1)
+        [ -z "$INSTALL_DEV" ] && INSTALL_DEV=$(basename "$INSTALL_SRC" | sed 's/[0-9]*$//')
+      fi
+      echo "[autoinstall] Install medium device: ${INSTALL_DEV:-<unknown>}"
+      for dev in $(lsblk -dn -o NAME,TRAN 2>/dev/null | awk '$2=="usb"{print $1}'); do
+        if [ "$dev" = "$INSTALL_DEV" ]; then
+          echo "[autoinstall] Keeping install USB: /dev/$dev"
+          continue
+        fi
+        if [ -w "/sys/block/$dev/device/delete" ]; then
+          echo "[autoinstall] Detaching external USB disk: /dev/$dev"
+          echo 1 > "/sys/block/$dev/device/delete"
+        fi
+      done
+      udevadm settle
+      true
     # Tear down any pre-existing LVM and wipe signatures on the largest
-    # fixed (non-removable) disk.  Without this, reinstalling onto a disk
+    # fixed (non-removable, non-USB) disk.  Without this, reinstalling onto a disk
     # that already holds an Ubuntu LVM layout makes curtin's `vgcreate
     # ubuntu-vg` fail with "/dev/ubuntu-vg: already exists in filesystem"
     # because the kernel auto-activates the old VG at boot and curtin's
@@ -75,9 +103,10 @@ autoinstall:
       for pv in $(pvs --noheadings -o pv_name 2>/dev/null | awk '{print $1}'); do
         pvremove -ff -y "$pv" 2>/dev/null
       done
-      # Identify the largest fixed disk (matches subiquity's `match: {size: largest}`)
-      TARGET=$(lsblk -dn -b -o NAME,SIZE,TYPE,RM 2>/dev/null \
-        | awk '$3=="disk" && $4==0 {print $2, $1}' \
+      # Identify the largest fixed disk (matches subiquity's `match: {size: largest}`).
+      # Skip removable AND USB-transport disks so external USB storage is never wiped.
+      TARGET=$(lsblk -dn -b -o NAME,SIZE,TYPE,RM,TRAN 2>/dev/null \
+        | awk '$3=="disk" && $4==0 && $5!="usb" {print $2, $1}' \
         | sort -rn | head -1 | awk '{print "/dev/"$2}')
       if [ -n "$TARGET" ] && [ -b "$TARGET" ]; then
         echo "[autoinstall] Wiping pre-existing signatures on $TARGET"
@@ -97,8 +126,10 @@ autoinstall:
     swap:
       size: 0
     config:
+      # `install-media: false` keeps subiquity from ever selecting the install USB itself,
+      # in addition to the early-command that detaches *other* USB drives.
       - {id: disk0, type: disk, ptable: gpt, wipe: superblock-recursive,
-         grub_device: false, match: {size: largest}}
+         grub_device: false, match: {size: largest, install-media: false}}
       - {id: efi-part, type: partition, device: disk0, size: 1G,
          flag: boot, grub_device: true}
       - {id: boot-part, type: partition, device: disk0, size: 2G}
