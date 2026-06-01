@@ -334,9 +334,19 @@ download_offline_packages() {
     return 0
   fi
 
-  # Release file suppresses apt warnings about missing metadata
+  # Release file suppresses apt warnings about missing metadata.
+  # Tag it with Origin/Label so the installed system can pin the repo
+  # to a low priority via /etc/apt/preferences.d/ — otherwise `apt
+  # upgrade` on the booted node would prefer offline-repo versions of
+  # things like linux-firmware over the upstream mirror, and any
+  # truncated/corrupt .deb on the USB would block the upgrade.
   if command -v apt-ftparchive >/dev/null 2>&1; then
-    (cd "$dest_dir" && apt-ftparchive release . 2>/dev/null > Release) || true
+    (cd "$dest_dir" && apt-ftparchive \
+        -o APT::FTPArchive::Release::Origin=k8thumbsup \
+        -o APT::FTPArchive::Release::Label=k8thumbsup-offline \
+        -o APT::FTPArchive::Release::Suite=offline \
+        -o APT::FTPArchive::Release::Codename=offline \
+        release . 2>/dev/null > Release) || true
   fi
 
   echo "  Packages index generated"
@@ -553,7 +563,12 @@ regenerate_offline_apt_index() {
     (cd "$dest_dir" && apt-ftparchive packages . 2>/dev/null > Packages)
   fi
   if command -v apt-ftparchive >/dev/null 2>&1; then
-    (cd "$dest_dir" && apt-ftparchive release . 2>/dev/null > Release) || true
+    (cd "$dest_dir" && apt-ftparchive \
+        -o APT::FTPArchive::Release::Origin=k8thumbsup \
+        -o APT::FTPArchive::Release::Label=k8thumbsup-offline \
+        -o APT::FTPArchive::Release::Suite=offline \
+        -o APT::FTPArchive::Release::Codename=offline \
+        release . 2>/dev/null > Release) || true
   fi
   local count; count=$(find "$dest_dir" -maxdepth 1 -name '*.deb' | wc -l)
   echo "  drivers/ now contains $count .deb file(s)"
